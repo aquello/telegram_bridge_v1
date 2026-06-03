@@ -152,3 +152,28 @@ def get_brokers_for_channel(channel_id: int) -> List[Dict]:
     cur.execute("SELECT * FROM channel_brokers WHERE channel_id=? AND enabled=1",(channel_id,))
     rows = cur.fetchall(); conn.close()
     return [dict(r) for r in rows]
+
+def get_last_open_signals_by_channel() -> List[Dict]:
+    """
+    Devuelve la última señal OPEN (PENDING/ACTIVE) de cada canal,
+    emitida en las últimas 4 horas. Usada para reconstruir el estado
+    en memoria tras un reinicio.
+    """
+    cutoff = int(time.time()) - 4 * 3600
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT s.*
+        FROM signals s
+        INNER JOIN (
+            SELECT channel_name, MAX(id) AS max_id
+            FROM signals
+            WHERE action = 'OPEN'
+              AND status IN ('PENDING', 'ACTIVE', 'EXECUTING')
+              AND created_at >= ?
+            GROUP BY channel_name
+        ) latest ON s.id = latest.max_id
+    """, (cutoff,))
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]

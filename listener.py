@@ -11,8 +11,10 @@ from telethon import TelegramClient, events
 from .db import (
     get_channel_config_by_telegram_id, init_schema,
     insert_raw_message, insert_signal, insert_sl_move,
+    get_last_open_signals_by_channel
 )
-from .universal_parser import parse_universal
+from .universal_parser import (parse_universal, restore_state_from_db)
+
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,9 @@ class TelegramSignalListener:
     async def start(self):
         await self.client.start()
         logger.info("Cliente Telethon v1 iniciado")
+        open_sigs = get_last_open_signals_by_channel()
+        restore_state_from_db(open_sigs)
+        logger.info("[BOOT] Estado restaurado: %d canales activos", len(open_sigs))
         self._register_handlers()
 
     def _register_handlers(self):

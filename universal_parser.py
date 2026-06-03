@@ -148,7 +148,15 @@ def _mgmt(cfg, action, symbol=None, sl=None, tp=None,
         "tg_message_id": tg_id,
         "tg_reply_to_id": tg_reply,
     }
-
+            
+def restore_state_from_db(open_signals):
+    for sig in open_signals:
+        tid = sig.get("telegram_id")
+        if not tid:
+            continue
+        st = _get_state(tid)
+        st.last_open = sig
+        st.last_ts = float(sig.get("created_at", time.time()))
 # ── Parser principal ──────────────────────────────────────────────────────────
 
 def parse_universal(

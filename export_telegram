@@ -1,0 +1,40 @@
+from telethon import TelegramClient
+import json
+from pathlib import Path
+
+API_ID = 123456
+API_HASH = "TU_API_HASH"
+SESSION = "tg_export_session"
+
+TARGETS = [
+    -1001234567890,   # o username / link
+    # "nombrecanal",
+]
+
+OUT = Path("telegram_examples")
+OUT.mkdir(exist_ok=True)
+
+async def export_channel(client, target, limit=300):
+    entity = await client.get_entity(target)
+    rows = []
+    async for m in client.iter_messages(entity, limit=limit, reverse=True):
+        rows.append({
+            "telegram_id": getattr(entity, "id", None),
+            "channel_title": getattr(entity, "title", None),
+            "message_id": m.id,
+            "reply_to_msg_id": m.reply_to.reply_to_msg_id if m.reply_to else None,
+            "date": m.date.isoformat() if m.date else None,
+            "text": m.message or "",
+        })
+    safe_name = str(getattr(entity, "title", str(target))).replace("/", "_").replace("\\", "_")
+    with open(OUT / f"{safe_name}.json", "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+
+async def main():
+    async with TelegramClient(SESSION, API_ID, API_HASH) as client:
+        for target in TARGETS:
+            await export_channel(client, target, limit=300)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())

@@ -154,17 +154,13 @@ def get_brokers_for_channel(channel_id: int) -> List[Dict]:
     return [dict(r) for r in rows]
 
 def get_last_open_signals_by_channel() -> List[Dict]:
-    """
-    Devuelve la última señal OPEN (PENDING/ACTIVE) de cada canal,
-    emitida en las últimas 4 horas. Usada para reconstruir el estado
-    en memoria tras un reinicio.
-    """
     cutoff = int(time.time()) - 4 * 3600
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT s.*
+        SELECT s.*, cc.telegram_id
         FROM signals s
+        INNER JOIN channel_config cc ON s.channel_name = cc.channel_name
         INNER JOIN (
             SELECT channel_name, MAX(id) AS max_id
             FROM signals

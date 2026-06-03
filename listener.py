@@ -1,20 +1,27 @@
 """
 listener.py – Escucha Telegram y procesa señales (telegram_bridge_v1)
 
-CAMBIO CLAVE: lookup de canal SOLO por telegram_id numérico.
-No hay dispatcher ni parser.py: se llama directamente a parse_universal.
+Mejoras:
+- Lookup solo por telegram_id.
+- Restaura estado multi-open al arrancar.
+- Unifica todas las inserciones en insert_signal().
+- Señal inversa saneada (tp1..tp10).
 """
+
 import logging
 from copy import deepcopy
 from typing import Dict, Optional
-from telethon import TelegramClient, events
-from .db import (
-    get_channel_config_by_telegram_id, init_schema,
-    insert_raw_message, insert_signal, insert_sl_move,
-    get_last_open_signals_by_channel
-)
-from .universal_parser import (parse_universal, restore_state_from_db)
 
+from telethon import TelegramClient, events
+
+from .db import (
+    get_channel_config_by_telegram_id,
+    get_last_open_signals,
+    init_schema,
+    insert_raw_message,
+    insert_signal,
+)
+from .universal_parser import parse_universal, restore_state_from_db
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +36,16 @@ class TelegramSignalListener:
     async def start(self):
         await self.client.start()
         logger.info("Cliente Telethon v1 iniciado")
-        open_sigs = get_last_open_signals_by_channel()
+        open_sigs = get_last_open_signals()
         restore_state_from_db(open_sigs)
-        logger.info("[BOOT] Estado restaurado: %d canales activos", len(open_sigs))
+        logger.info("[BOOT] Estado restaurado: %d OPEN activas", len(open_sigs))
         self._register_handlers()
+
+    def _lookup_cfg(self, raw_id: int) -> Optional[Dict]:
+        cfg = get_channel_config_by_telegram_id(raw_id)
+        if cfg is None:
+            cfg = get_channel_config_by_telegram_id(-(1_000_000_000_000 + abs(raw_id)))
+        return cfg
 
     def _register_handlers(self):
         @self.client.on(events.NewMessage())
@@ -40,96 +53,93 @@ class TelegramSignalListener:
             try:
                 chat = await event.get_chat()
                 raw_id = chat.id
-                # Probamos raw_id y la forma -100xxxxxxxxxx
-                cfg = get_channel_config_by_telegram_id(raw_id)
+                cfg = self._lookup_cfg(raw_id)
                 if cfg is None:
-                    cfg = get_channel_config_by_telegram_id(-(1_000_000_000_000 + abs(raw_id)))
-                if cfg is None:
-                    return  # canal no configurado → ignorar silenciosamente
+                    return
 
                 msg = event.message
                 text = msg.message or ""
                 if not text.strip():
                     return
 
-                channel_name  = cfg["channel_name"]
+                channel_name = cfg["channel_name"]
                 reply_to_id: Optional[int] = msg.reply_to_msg_id
 
-                raw_msg_id = insert_raw_message({
-                    "channel_id":   str(raw_id),
-                    "channel_name": channel_name,
-                    "message_id":   msg.id,
-                    "date":         int(msg.date.timestamp()),
-                    "text":         text,
-                    "raw_json":     None,
-                })
+                raw_msg_id = insert_raw_message(
+                    {
+                        "channel_id": str(raw_id),
+                        "channel_name": channel_name,
+                        "message_id": msg.id,
+                        "date": int(msg.date.timestamp()),
+                        "text": text,
+                        "raw_json": None,
+                    }
+                )
 
-                logger.info("[PARSE] canal=%s id=%s text=%r", channel_name, msg.id, text[:120])
-                signals_raw = parse_universal(text, cfg,
-                                              tg_message_id=msg.id,
-                                              tg_reply_to_id=reply_to_id)
+                logger.info("[PARSE] canal=%s id=%s text=%r", channel_name, msg.id, text[:160])
+                signals_raw = parse_universal(
+                    text,
+                    cfg,
+                    tg_message_id=msg.id,
+                    tg_reply_to_id=reply_to_id,
+                )
                 if not signals_raw:
                     logger.info("[NONE] canal=%s id=%s", channel_name, msg.id)
                     return
 
                 enriched = []
                 for sd in signals_raw:
-                    sd = dict(sd)
-                    sd["raw_message_id"] = raw_msg_id
-                    sd.setdefault("tg_message_id", msg.id)
-                    sd.setdefault("tg_reply_to_id", reply_to_id)
-                    sd["channel_name"] = channel_name
-
-                    action = sd.get("action", "")
-
-                    if action == "SL_MOVE":
-                        sid = insert_sl_move(sd["symbol"], channel_name,
-                                             sd["sl"], reply_to_id or 0)
-                        logger.info("SL_MOVE id=%s canal=%s sl=%s", sid, channel_name, sd["sl"])
-                        continue
-
-                    if action in ("TP_DONE",):
-                        continue
-
-                    # OPEN: asignar tp = tp más alto disponible
-                    if action == "OPEN" and sd.get("tp1"):
-                        tp_final = next(
-                            (sd.get(f"tp{i}") for i in range(10, 0, -1) if sd.get(f"tp{i}")),
+                    sig = dict(sd)
+                    sig["raw_message_id"] = raw_msg_id
+                    sig["telegram_id"] = cfg["telegram_id"]
+                    sig.setdefault("tg_message_id", msg.id)
+                    sig.setdefault("tg_reply_to_id", reply_to_id)
+                    sig["channel_name"] = channel_name
+                    if sig.get("action") == "OPEN":
+                        final_tp = next(
+                            (sig.get(f"tp{i}") for i in range(10, 0, -1) if sig.get(f"tp{i}") is not None),
                             None
                         )
-                        if tp_final:
-                            sd["tp"] = tp_final
+                        if final_tp is not None:
+                            sig["tp"] = final_tp
+                    enriched.append(sig)
 
-                    enriched.append(sd)
-
-                # Señal inversa
                 if cfg.get("enable_reverse", 0):
-                    for orig in list(enriched):
+                    reverse_batch = []
+                    for orig in enriched:
                         if orig.get("action") != "OPEN":
                             continue
                         if not orig.get("symbol") or not orig.get("direction"):
                             continue
                         rev = deepcopy(orig)
-                        if cfg.get("magic_reverse"):
+                        if cfg.get("magic_reverse") is not None:
                             rev["magic"] = cfg["magic_reverse"]
                         rev["direction"] = "SELL" if orig["direction"] == "BUY" else "BUY"
                         sl, tp = orig.get("sl"), orig.get("tp")
                         if sl is not None and tp is not None:
                             rev["sl"], rev["tp"] = tp, sl
-                        for k in ("tp1","tp2","tp3","tp4","tp5","tp_stage"):
-                            rev[k] = 0
-                        rev["tg_message_id"] = -1 * orig["tg_message_id"]
+                        for i in range(1, 11):
+                            rev[f"tp{i}"] = None
+                        rev["tp_stage"] = 0
+                        rev["tg_message_id"] = -1 * int(orig["tg_message_id"])
                         if cfg.get("execution_type_rev"):
                             rev["execution_type"] = cfg["execution_type_rev"]
-                        enriched.append(rev)
+                        reverse_batch.append(rev)
+                    enriched.extend(reverse_batch)
 
                 for sig in enriched:
                     if not sig.get("action"):
                         continue
                     sid = insert_signal(sig)
-                    logger.info("Signal id=%s action=%s symbol=%s dir=%s magic=%s",
-                                sid, sig.get("action"), sig.get("symbol"),
-                                sig.get("direction"), sig.get("magic"))
+                    logger.info(
+                        "Signal id=%s canal=%s action=%s symbol=%s dir=%s magic=%s",
+                        sid,
+                        sig.get("channel_name"),
+                        sig.get("action"),
+                        sig.get("symbol"),
+                        sig.get("direction"),
+                        sig.get("magic"),
+                    )
 
             except Exception as e:
                 logger.exception("Error procesando mensaje: %s", e)

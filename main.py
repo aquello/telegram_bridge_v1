@@ -6,7 +6,7 @@ setup_logging("telegram_bridge_v1")
 logger = logging.getLogger(__name__)
 logger.info("Iniciando Telegram Bridge v1...")
 
-API_ID   = 2395042
+API_ID = 2395042
 API_HASH = "77287044cf5b6582e3cac8b0d2f25c2e"
 
 def main():

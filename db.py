@@ -74,23 +74,6 @@ CREATE TABLE IF NOT EXISTS signals (
     exported_mt4 INTEGER DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS signal_events (
-    id INTEGER PRIMARY KEY,
-    raw_message_id INTEGER,
-    signal_id INTEGER,
-    channel_name TEXT,
-    telegram_id INTEGER,
-    tg_message_id INTEGER,
-    tg_reply_to_id INTEGER,
-    symbol TEXT,
-    event_type TEXT NOT NULL,
-    event_value TEXT,
-    event_price REAL,
-    created_at INTEGER NOT NULL,
-    status TEXT DEFAULT 'PENDING',
-    exported_mt4 INTEGER DEFAULT 0
-);
-
 CREATE TABLE IF NOT EXISTS executions (
     id INTEGER PRIMARY KEY,
     signal_id INTEGER,
@@ -132,17 +115,14 @@ CREATE TABLE IF NOT EXISTS channel_brokers (
     FOREIGN KEY (channel_id) REFERENCES channel_config(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_raw_messages_channel_msg
-ON raw_messages(channel_id, message_id);
+CREATE INDEX IF NOT EXISTS idx_channel_config_telegram_id
+ON channel_config(telegram_id);
 
-CREATE INDEX IF NOT EXISTS idx_signals_channel_msg
-ON signals(channel_name, tg_message_id);
+CREATE INDEX IF NOT EXISTS idx_channel_config_enabled
+ON channel_config(enabled);
 
-CREATE INDEX IF NOT EXISTS idx_signal_events_status
-ON signal_events(status, exported_mt4);
-
-CREATE INDEX IF NOT EXISTS idx_signal_events_msg
-ON signal_events(channel_name, tg_message_id, tg_reply_to_id);
+CREATE INDEX IF NOT EXISTS idx_signals_channel_name
+ON signals(channel_name);
 """
 
 _MIGRATIONS = [
@@ -210,8 +190,7 @@ def insert_signal(data: Dict[str, Any]) -> int:
     for k in (
         "risk_pct", "volume_hint", "entry_min", "entry_max", "magic",
         "tp_label", "error_msg", "tp", "sl", "tp1", "tp2", "tp3",
-        "tp4", "tp5", "tp6", "tp7", "tp8", "tp9", "tp10",
-        "tg_reply_to_id"
+        "tp4", "tp5", "tp6", "tp7", "tp8", "tp9", "tp10"
     ):
         data.setdefault(k, None)
 
@@ -222,6 +201,7 @@ def insert_signal(data: Dict[str, Any]) -> int:
     data.setdefault("symbol", None)
     data.setdefault("execution_type", "MARKET")
     data.setdefault("created_at", int(time.time()))
+    data.setdefault("tg_reply_to_id", None)
 
     cur = conn.cursor()
     cur.execute(
@@ -242,52 +222,10 @@ def insert_signal(data: Dict[str, Any]) -> int:
         """,
         data,
     )
-
     conn.commit()
     sid = cur.lastrowid
     conn.close()
     return sid
-
-
-def insert_signal_event(data: Dict[str, Any]) -> int:
-    conn = get_connection()
-    cur = conn.cursor()
-
-    payload = {
-        "raw_message_id": data.get("raw_message_id"),
-        "signal_id": data.get("signal_id"),
-        "channel_name": data.get("channel_name"),
-        "telegram_id": data.get("telegram_id"),
-        "tg_message_id": data.get("tg_message_id"),
-        "tg_reply_to_id": data.get("tg_reply_to_id"),
-        "symbol": data.get("symbol"),
-        "event_type": data.get("event_type"),
-        "event_value": data.get("event_value"),
-        "event_price": data.get("event_price"),
-        "created_at": data.get("created_at", int(time.time())),
-        "status": data.get("status", "PENDING"),
-        "exported_mt4": data.get("exported_mt4", 0),
-    }
-
-    cur.execute(
-        """
-        INSERT INTO signal_events (
-            raw_message_id, signal_id, channel_name, telegram_id,
-            tg_message_id, tg_reply_to_id, symbol, event_type,
-            event_value, event_price, created_at, status, exported_mt4
-        ) VALUES (
-            :raw_message_id, :signal_id, :channel_name, :telegram_id,
-            :tg_message_id, :tg_reply_to_id, :symbol, :event_type,
-            :event_value, :event_price, :created_at, :status, :exported_mt4
-        )
-        """,
-        payload,
-    )
-
-    conn.commit()
-    rid = cur.lastrowid
-    conn.close()
-    return rid
 
 
 def insert_sl_move(symbol, channel_name, new_sl, tg_reply_to_id) -> int:
@@ -329,10 +267,119 @@ def get_channel_config_by_telegram_id(telegram_id: int) -> Optional[Dict]:
 def get_all_channel_configs() -> List[Dict]:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM channel_config WHERE enabled=1")
+    cur.execute("SELECT * FROM channel_config ORDER BY channel_name COLLATE NOCASE")
     rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_channel_config_map() -> Dict[int, Dict]:
+    rows = get_all_channel_configs()
+    out = {}
+    for r in rows:
+        try:
+            out[int(r["telegram_id"])] = r
+        except Exception:
+            continue
+    return out
+
+
+def upsert_channel_config(
+    *,
+    channel_name: str,
+    telegram_id: int,
+    magic: int,
+    enabled: int = 1,
+    enable_reverse: int = 0,
+    magic_reverse: Optional[int] = None,
+    execution_type: str = "MARKET",
+    execution_type_rev: Optional[str] = None,
+    risk_pct: float = 2.0,
+    partial_tp_config: Optional[str] = None,
+) -> int:
+    now_ts = int(time.time())
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT id FROM channel_config WHERE telegram_id=?",
+        (telegram_id,),
+    )
+    row = cur.fetchone()
+
+    if row:
+        cur.execute(
+            """
+            UPDATE channel_config
+            SET
+                channel_name=?,
+                magic=?,
+                risk_pct=?,
+                execution_type=?,
+                enabled=?,
+                enable_reverse=?,
+                magic_reverse=?,
+                execution_type_rev=?,
+                partial_tp_config=?,
+                updated_at=?
+            WHERE telegram_id=?
+            """,
+            (
+                channel_name,
+                magic,
+                risk_pct,
+                execution_type,
+                enabled,
+                enable_reverse,
+                magic_reverse,
+                execution_type_rev,
+                partial_tp_config,
+                now_ts,
+                telegram_id,
+            ),
+        )
+        cfg_id = row["id"]
+    else:
+        cur.execute(
+            """
+            INSERT INTO channel_config (
+                channel_name, telegram_id, magic, risk_pct,
+                execution_type, enabled, enable_reverse,
+                magic_reverse, execution_type_rev,
+                created_at, updated_at, partial_tp_config
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                channel_name,
+                telegram_id,
+                magic,
+                risk_pct,
+                execution_type,
+                enabled,
+                enable_reverse,
+                magic_reverse,
+                execution_type_rev,
+                now_ts,
+                now_ts,
+                partial_tp_config,
+            ),
+        )
+        cfg_id = cur.lastrowid
+
+    conn.commit()
+    conn.close()
+    return cfg_id
+
+
+def disable_channel_config(telegram_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE channel_config SET enabled=0, updated_at=? WHERE telegram_id=?",
+        (int(time.time()), telegram_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_brokers_for_channel(channel_id: int) -> List[Dict]:

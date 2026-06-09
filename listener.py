@@ -9,11 +9,49 @@ from .db import (
     init_schema,
     insert_raw_message,
     insert_signal,
-    insert_sl_move,
+    insert_signal_event,
 )
 from .universal_parser import parse_universal
 
 logger = logging.getLogger(__name__)
+
+
+def _event_from_signal(sig: dict, cfg: dict, raw_message_id: int) -> dict:
+    action = (sig.get("action") or "").upper()
+
+    event_type_map = {
+        "OPEN": "OPEN",
+        "PARTIAL": "TP_HIT",
+        "BE": "BREAKEVEN",
+        "SL_MOVE": "SL_MOVE",
+        "TP_UPDATE": "TP_UPDATE",
+        "CLOSE": "CLOSE",
+        "CLOSE_ALL": "CLOSE_ALL",
+        "CANCEL": "CANCEL",
+    }
+
+    event_type = event_type_map.get(action, action or "UNKNOWN")
+    event_value = sig.get("tp_label") if action == "PARTIAL" else None
+    event_price = None
+
+    if action in ("SL_MOVE", "TP_UPDATE", "CLOSE"):
+        event_price = sig.get("sl") if action == "SL_MOVE" else sig.get("tp")
+
+    return {
+        "raw_message_id": raw_message_id,
+        "signal_id": None,
+        "channel_name": sig.get("channel_name") or cfg["channel_name"],
+        "telegram_id": cfg.get("telegram_id"),
+        "tg_message_id": sig.get("tg_message_id"),
+        "tg_reply_to_id": sig.get("tg_reply_to_id"),
+        "symbol": sig.get("symbol"),
+        "event_type": event_type,
+        "event_value": event_value,
+        "event_price": event_price,
+        "created_at": sig.get("created_at"),
+        "status": "PENDING",
+    }
+
 
 class TelegramSignalListener:
     def __init__(self, api_id: int, api_hash: str, session_name: str = "tg_session_v1"):
@@ -49,16 +87,18 @@ class TelegramSignalListener:
                 channel_name = cfg["channel_name"]
                 reply_to_id: Optional[int] = msg.reply_to_msg_id
 
-                raw_msg_id = insert_raw_message({
-                    "channel_id": str(raw_id),
-                    "channel_name": channel_name,
-                    "message_id": msg.id,
-                    "date": int(msg.date.timestamp()),
-                    "text": text,
-                    "raw_json": None,
-                })
+                raw_msg_id = insert_raw_message(
+                    {
+                        "channel_id": str(raw_id),
+                        "channel_name": channel_name,
+                        "message_id": msg.id,
+                        "date": int(msg.date.timestamp()),
+                        "text": text,
+                        "raw_json": None,
+                    }
+                )
 
-                logger.info("[PARSE] canal=%s id=%s text=%r", channel_name, msg.id, text[:120])
+                logger.info("[PARSE] canal=%s id=%s text=%r", channel_name, msg.id, text[:160])
 
                 signals_raw = parse_universal(
                     text,
@@ -80,34 +120,21 @@ class TelegramSignalListener:
                     sd.setdefault("tg_reply_to_id", reply_to_id)
                     sd["channel_name"] = channel_name
 
-                    action = sd.get("action", "")
-
-                    if action == "SL_MOVE":
-                        sid = insert_sl_move(
-                            sd["symbol"],
-                            channel_name,
-                            sd["sl"],
-                            reply_to_id or 0,
-                        )
-                        logger.info("SL_MOVE id=%s canal=%s sl=%s", sid, channel_name, sd["sl"])
-                        continue
-
-                    if action in ("TP_DONE",):
-                        continue
+                    action = (sd.get("action") or "").upper()
 
                     if action == "OPEN" and sd.get("tp1"):
                         tp_final = next(
-                            (sd.get(f"tp{i}") for i in range(10, 0, -1) if sd.get(f"tp{i}")),
+                            (sd.get(f"tp{i}") for i in range(10, 0, -1) if sd.get(f"tp{i}") is not None),
                             None,
                         )
-                        if tp_final:
+                        if tp_final is not None:
                             sd["tp"] = tp_final
 
                     enriched.append(sd)
 
                 if cfg.get("enable_reverse", 0):
                     for orig in list(enriched):
-                        if orig.get("action") != "OPEN":
+                        if (orig.get("action") or "").upper() != "OPEN":
                             continue
                         if not orig.get("symbol") or not orig.get("direction"):
                             continue
@@ -123,10 +150,11 @@ class TelegramSignalListener:
                         if sl is not None and tp is not None:
                             rev["sl"], rev["tp"] = tp, sl
 
-                        for k in ("tp1", "tp2", "tp3", "tp4", "tp5", "tp_stage"):
-                            rev[k] = 0
+                        for k in ("tp1", "tp2", "tp3", "tp4", "tp5", "tp6", "tp7", "tp8", "tp9", "tp10"):
+                            rev[k] = None
 
-                        rev["tg_message_id"] = -1 * orig["tg_message_id"]
+                        rev["tp_stage"] = 0
+                        rev["tg_message_id"] = -1 * int(orig["tg_message_id"])
 
                         if cfg.get("execution_type_rev"):
                             rev["execution_type"] = cfg["execution_type_rev"]
@@ -136,7 +164,13 @@ class TelegramSignalListener:
                 for sig in enriched:
                     if not sig.get("action"):
                         continue
+
                     sid = insert_signal(sig)
+
+                    event_payload = _event_from_signal(sig, cfg, raw_msg_id)
+                    event_payload["signal_id"] = sid
+                    insert_signal_event(event_payload)
+
                     logger.info(
                         "Signal id=%s action=%s symbol=%s dir=%s magic=%s",
                         sid,

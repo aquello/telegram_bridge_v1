@@ -7,18 +7,22 @@ DB_PATH_REAL = r"C:\Users\AdmVps\AppData\Roaming\MetaQuotes\Terminal\Common\File
 DB_PATH_BT = os.path.join(os.path.dirname(DB_PATH_REAL), "signals_bt.db")
 DB_PATH = DB_PATH_REAL
 
+
 def use_backtest_db():
     global DB_PATH
     DB_PATH = DB_PATH_BT
+
 
 def use_real_db():
     global DB_PATH
     DB_PATH = DB_PATH_REAL
 
+
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -70,6 +74,23 @@ CREATE TABLE IF NOT EXISTS signals (
     exported_mt4 INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS signal_events (
+    id INTEGER PRIMARY KEY,
+    raw_message_id INTEGER,
+    signal_id INTEGER,
+    channel_name TEXT,
+    telegram_id INTEGER,
+    tg_message_id INTEGER,
+    tg_reply_to_id INTEGER,
+    symbol TEXT,
+    event_type TEXT NOT NULL,
+    event_value TEXT,
+    event_price REAL,
+    created_at INTEGER NOT NULL,
+    status TEXT DEFAULT 'PENDING',
+    exported_mt4 INTEGER DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS executions (
     id INTEGER PRIMARY KEY,
     signal_id INTEGER,
@@ -110,6 +131,18 @@ CREATE TABLE IF NOT EXISTS channel_brokers (
     enabled INTEGER DEFAULT 1,
     FOREIGN KEY (channel_id) REFERENCES channel_config(id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_raw_messages_channel_msg
+ON raw_messages(channel_id, message_id);
+
+CREATE INDEX IF NOT EXISTS idx_signals_channel_msg
+ON signals(channel_name, tg_message_id);
+
+CREATE INDEX IF NOT EXISTS idx_signal_events_status
+ON signal_events(status, exported_mt4);
+
+CREATE INDEX IF NOT EXISTS idx_signal_events_msg
+ON signal_events(channel_name, tg_message_id, tg_reply_to_id);
 """
 
 _MIGRATIONS = [
@@ -135,6 +168,7 @@ _MIGRATIONS = [
     "ALTER TABLE channel_config ADD COLUMN execution_type_rev TEXT",
 ]
 
+
 def init_schema():
     conn = get_connection()
     cur = conn.cursor()
@@ -148,6 +182,7 @@ def init_schema():
 
     conn.commit()
     conn.close()
+
 
 def insert_raw_message(data: Dict[str, Any]) -> int:
     conn = get_connection()
@@ -166,6 +201,7 @@ def insert_raw_message(data: Dict[str, Any]) -> int:
     rid = cur.lastrowid
     conn.close()
     return rid
+
 
 def insert_signal(data: Dict[str, Any]) -> int:
     conn = get_connection()
@@ -206,10 +242,53 @@ def insert_signal(data: Dict[str, Any]) -> int:
         """,
         data,
     )
+
     conn.commit()
     sid = cur.lastrowid
     conn.close()
     return sid
+
+
+def insert_signal_event(data: Dict[str, Any]) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+
+    payload = {
+        "raw_message_id": data.get("raw_message_id"),
+        "signal_id": data.get("signal_id"),
+        "channel_name": data.get("channel_name"),
+        "telegram_id": data.get("telegram_id"),
+        "tg_message_id": data.get("tg_message_id"),
+        "tg_reply_to_id": data.get("tg_reply_to_id"),
+        "symbol": data.get("symbol"),
+        "event_type": data.get("event_type"),
+        "event_value": data.get("event_value"),
+        "event_price": data.get("event_price"),
+        "created_at": data.get("created_at", int(time.time())),
+        "status": data.get("status", "PENDING"),
+        "exported_mt4": data.get("exported_mt4", 0),
+    }
+
+    cur.execute(
+        """
+        INSERT INTO signal_events (
+            raw_message_id, signal_id, channel_name, telegram_id,
+            tg_message_id, tg_reply_to_id, symbol, event_type,
+            event_value, event_price, created_at, status, exported_mt4
+        ) VALUES (
+            :raw_message_id, :signal_id, :channel_name, :telegram_id,
+            :tg_message_id, :tg_reply_to_id, :symbol, :event_type,
+            :event_value, :event_price, :created_at, :status, :exported_mt4
+        )
+        """,
+        payload,
+    )
+
+    conn.commit()
+    rid = cur.lastrowid
+    conn.close()
+    return rid
+
 
 def insert_sl_move(symbol, channel_name, new_sl, tg_reply_to_id) -> int:
     conn = get_connection()
@@ -234,6 +313,7 @@ def insert_sl_move(symbol, channel_name, new_sl, tg_reply_to_id) -> int:
     conn.close()
     return rid
 
+
 def get_channel_config_by_telegram_id(telegram_id: int) -> Optional[Dict]:
     conn = get_connection()
     cur = conn.cursor()
@@ -245,6 +325,7 @@ def get_channel_config_by_telegram_id(telegram_id: int) -> Optional[Dict]:
     conn.close()
     return dict(row) if row else None
 
+
 def get_all_channel_configs() -> List[Dict]:
     conn = get_connection()
     cur = conn.cursor()
@@ -252,6 +333,7 @@ def get_all_channel_configs() -> List[Dict]:
     rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
 
 def get_brokers_for_channel(channel_id: int) -> List[Dict]:
     conn = get_connection()

@@ -1,7 +1,7 @@
 import sys
 import traceback
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QAction, QColor
@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QSizePolicy,
     QSplitter,
     QStatusBar,
     QTableWidget,
@@ -27,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .db import get_channel_config_map, init_schema, upsert_channel_config
+from .db import get_channel_config_map, init_schema, upsert_channel_config, disable_channel_config
 from .listener import TelegramSignalListener
 from .telegram_service import TelegramDialogInfo, TelegramDialogService
 
@@ -38,11 +37,13 @@ class RowState:
     enabled: bool = True
     channel_name: str = ""
     telegram_id: int = 0
+    entity_type: str = "unknown"
     magic: str = ""
     enable_reverse: bool = False
     magic_reverse: str = ""
     execution_type: str = "MARKET"
     execution_type_rev: str = "MARKET"
+    risk_pct: str = "2.0"
     configured: bool = False
 
 
@@ -91,11 +92,7 @@ class ListenerWorker(QThread):
     def run(self):
         try:
             self.status_text.emit("Iniciando listener...")
-            listener = TelegramSignalListener(
-                self.api_id,
-                self.api_hash,
-                session_name=self.session_name,
-            )
+            listener = TelegramSignalListener(self.api_id, self.api_hash, session_name=self.session_name)
             listener.run_forever()
         except Exception:
             self.failed.emit(traceback.format_exc())
@@ -139,7 +136,7 @@ class ChannelManagerWindow(QMainWindow):
         title_box = QVBoxLayout()
         title = QLabel("Telegram Bridge")
         title.setObjectName("TitleLabel")
-        subtitle = QLabel("Gestión visual de canales, configuración persistente y arranque del listener")
+        subtitle = QLabel("Gestión visual de canales y configuración persistente por telegram_id")
         subtitle.setObjectName("SubtitleLabel")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
@@ -173,7 +170,7 @@ class ChannelManagerWindow(QMainWindow):
         left_layout.setContentsMargins(12, 12, 12, 12)
         left_layout.setSpacing(10)
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels([
             "Sel",
             "Canal",
@@ -182,6 +179,7 @@ class ChannelManagerWindow(QMainWindow):
             "Magic",
             "Inverso",
             "Magic Rev",
+            "Risk %",
             "Configurado",
         ])
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -189,15 +187,15 @@ class ChannelManagerWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
-        self.table.horizontalHeader().setStretchLastSection(False)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeToContents)
 
         left_layout.addWidget(self.table)
         splitter.addWidget(left_panel)
@@ -259,8 +257,9 @@ class ChannelManagerWindow(QMainWindow):
         right_layout.addLayout(actions)
 
         info_box = QLabel(
-            "Flujo: refrescas canales, seleccionas los que quieras usar, asignas magic e inverso, "
-            "guardas, y a partir de ahí el listener leerá channel_config por telegram_id."
+            "Marca los canales que quieres usar, asigna magic y guarda. "
+            "La configuración se persiste en channel_config para que al reiniciar "
+            "ya aparezcan como configurados."
         )
         info_box.setWordWrap(True)
         info_box.setObjectName("InfoBox")
@@ -282,6 +281,7 @@ class ChannelManagerWindow(QMainWindow):
         self.btn_apply_row.clicked.connect(self.apply_editor_to_current_row)
         self.btn_reload_row.clicked.connect(self.load_current_row_into_editor)
         self.table.itemSelectionChanged.connect(self.on_table_selection_changed)
+        self.table.itemChanged.connect(self.on_table_item_changed)
 
         self._build_menu()
         self._apply_styles()
@@ -289,7 +289,6 @@ class ChannelManagerWindow(QMainWindow):
     def _build_menu(self):
         action_exit = QAction("Salir", self)
         action_exit.triggered.connect(self.close)
-
         menu = self.menuBar().addMenu("Archivo")
         menu.addAction(action_exit)
 
@@ -428,11 +427,13 @@ class ChannelManagerWindow(QMainWindow):
                         enabled=bool(cfg.get("enabled", 0)),
                         channel_name=cfg.get("channel_name") or d.title,
                         telegram_id=int(d.telegram_id),
+                        entity_type=d.entity_type,
                         magic=str(cfg.get("magic") or ""),
                         enable_reverse=bool(cfg.get("enable_reverse", 0)),
                         magic_reverse=str(cfg.get("magic_reverse") or ""),
                         execution_type=cfg.get("execution_type") or "MARKET",
                         execution_type_rev=cfg.get("execution_type_rev") or "MARKET",
+                        risk_pct=str(cfg.get("risk_pct") or "2.0"),
                         configured=True,
                     )
                 )
@@ -443,11 +444,13 @@ class ChannelManagerWindow(QMainWindow):
                         enabled=True,
                         channel_name=d.title,
                         telegram_id=int(d.telegram_id),
+                        entity_type=d.entity_type,
                         magic="",
                         enable_reverse=False,
                         magic_reverse="",
                         execution_type="MARKET",
                         execution_type_rev="MARKET",
+                        risk_pct="2.0",
                         configured=False,
                     )
                 )
@@ -455,6 +458,8 @@ class ChannelManagerWindow(QMainWindow):
         self.rows = rows
 
     def _render_table(self):
+        self.table.blockSignals(True)
+
         show_only = self.btn_show_configured.isChecked()
         visible_rows = []
         for idx, r in enumerate(self.rows):
@@ -479,7 +484,7 @@ class ChannelManagerWindow(QMainWindow):
             id_item.setData(Qt.UserRole, real_idx)
             self.table.setItem(table_row, 2, id_item)
 
-            type_item = QTableWidgetItem(self._detect_type_name(row.telegram_id))
+            type_item = QTableWidgetItem(row.entity_type)
             type_item.setData(Qt.UserRole, real_idx)
             self.table.setItem(table_row, 3, type_item)
 
@@ -495,21 +500,17 @@ class ChannelManagerWindow(QMainWindow):
             magic_rev_item.setData(Qt.UserRole, real_idx)
             self.table.setItem(table_row, 6, magic_rev_item)
 
+            risk_item = QTableWidgetItem(row.risk_pct)
+            risk_item.setData(Qt.UserRole, real_idx)
+            self.table.setItem(table_row, 7, risk_item)
+
             conf_item = QTableWidgetItem("Sí" if row.configured else "No")
             conf_item.setData(Qt.UserRole, real_idx)
-            if row.configured:
-                conf_item.setForeground(QColor("#72e3c0"))
-            else:
-                conf_item.setForeground(QColor("#f0c36d"))
-            self.table.setItem(table_row, 7, conf_item)
+            conf_item.setForeground(QColor("#72e3c0") if row.configured else QColor("#f0c36d"))
+            self.table.setItem(table_row, 8, conf_item)
 
         self.table.resizeRowsToContents()
-
-    def _detect_type_name(self, telegram_id: int) -> str:
-        for d in self.dialogs:
-            if int(d.telegram_id) == int(telegram_id):
-                return d.entity_type
-        return "unknown"
+        self.table.blockSignals(False)
 
     def toggle_show_configured(self):
         state = self.btn_show_configured.isChecked()
@@ -526,6 +527,14 @@ class ChannelManagerWindow(QMainWindow):
         self.selected_row_index = int(real_idx)
         self.load_current_row_into_editor()
 
+    def on_table_item_changed(self, item: QTableWidgetItem):
+        if item.column() != 0:
+            return
+        real_idx = item.data(Qt.UserRole)
+        if real_idx is None:
+            return
+        self.rows[int(real_idx)].selected = item.checkState() == Qt.Checked
+
     def load_current_row_into_editor(self):
         if self.selected_row_index is None:
             return
@@ -539,7 +548,7 @@ class ChannelManagerWindow(QMainWindow):
         self.input_magic_reverse.setText(row.magic_reverse)
         self.cmb_exec_type.setCurrentText(row.execution_type or "MARKET")
         self.cmb_exec_type_rev.setCurrentText(row.execution_type_rev or "MARKET")
-        self.input_risk.setText("2.0")
+        self.input_risk.setText(row.risk_pct or "2.0")
 
     def apply_editor_to_current_row(self):
         if self.selected_row_index is None:
@@ -554,6 +563,7 @@ class ChannelManagerWindow(QMainWindow):
         row.magic_reverse = self.input_magic_reverse.text().strip()
         row.execution_type = self.cmb_exec_type.currentText()
         row.execution_type_rev = self.cmb_exec_type_rev.currentText()
+        row.risk_pct = self.input_risk.text().strip() or "2.0"
         row.configured = bool(row.magic)
 
         self.status.showMessage(f"Fila actualizada: {row.channel_name}")
@@ -564,20 +574,25 @@ class ChannelManagerWindow(QMainWindow):
             if not row.magic:
                 raise ValueError(f"El canal '{row.channel_name}' está seleccionado pero no tiene magic.")
             int(row.magic)
+            float(row.risk_pct)
 
-            if row.enable_reverse and row.magic_reverse:
+            if row.enable_reverse:
+                if not row.magic_reverse:
+                    raise ValueError(
+                        f"El canal '{row.channel_name}' tiene inverso activado pero no magic inverso."
+                    )
                 int(row.magic_reverse)
-            elif row.enable_reverse and not row.magic_reverse:
-                raise ValueError(f"El canal '{row.channel_name}' tiene inverso activado pero no magic inverso.")
 
     def save_all(self):
         if self.selected_row_index is not None:
             self.apply_editor_to_current_row()
 
         saved = 0
+        disabled = 0
+
         for row in self.rows:
-            self._validate_row(row)
             if row.selected:
+                self._validate_row(row)
                 upsert_channel_config(
                     channel_name=row.channel_name,
                     telegram_id=row.telegram_id,
@@ -587,16 +602,24 @@ class ChannelManagerWindow(QMainWindow):
                     magic_reverse=int(row.magic_reverse) if row.magic_reverse else None,
                     execution_type=row.execution_type,
                     execution_type_rev=row.execution_type_rev if row.enable_reverse else None,
-                    risk_pct=float(self.input_risk.text().strip() or "2.0"),
+                    risk_pct=float(row.risk_pct),
                 )
                 row.configured = True
                 saved += 1
+            else:
+                disable_channel_config(row.telegram_id)
+                if row.configured:
+                    disabled += 1
 
-        self.status.showMessage(f"Configuración guardada. Canales activos: {saved}")
+        self.status.showMessage(
+            f"Configuración guardada. Activos: {saved} · Desactivados: {disabled}"
+        )
         QMessageBox.information(
             self,
             "Guardar configuración",
-            f"Configuración guardada correctamente.\nCanales activos configurados: {saved}",
+            f"Configuración guardada correctamente.\n"
+            f"Canales activos: {saved}\n"
+            f"Canales desactivados: {disabled}",
         )
         self._render_table()
 
@@ -615,6 +638,7 @@ class ChannelManagerWindow(QMainWindow):
         self.listener_worker.status_text.connect(self.status.showMessage)
         self.listener_worker.failed.connect(self._on_worker_failed)
         self.listener_worker.start()
+
         QMessageBox.information(
             self,
             "Listener",

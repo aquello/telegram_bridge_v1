@@ -55,7 +55,6 @@ class TelegramDialogService:
             )
 
         await client.disconnect()
-
         dialogs_out.sort(key=lambda x: (x.entity_type, x.title.lower()))
         return dialogs_out
 

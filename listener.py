@@ -24,12 +24,19 @@ class TelegramSignalListener:
         api_id: int,
         api_hash: str,
         session_name: str = "tg_session_v1",
+        progress_callback: Optional[Callable[[str], None]] = None,
     ):
         self.api_id = api_id
         self.api_hash = api_hash
         self.session_name = session_name
+        self.progress_callback = progress_callback
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.client: Optional[TelegramClient] = None
+
+    def _emit(self, text: str):
+        logger.info(text)
+        if self.progress_callback:
+            self.progress_callback(text)
 
     # ------------------------------------------------------------------
     # LOOP / CLIENT
@@ -65,6 +72,7 @@ class TelegramSignalListener:
         self._ensure_client()
 
         if not self.client.is_connected():
+            self._emit("INFO | TELETHON | Conectando cliente...")
             await self.client.connect()
 
         if not await self.client.is_user_authorized():
@@ -73,15 +81,21 @@ class TelegramSignalListener:
                 "Abre primero la aplicación en modo normal y valida la sesión."
             )
 
+        self._emit("INFO | TELETHON | Cliente conectado y autorizado")
+
     async def _start_client_for_live(self):
         self._ensure_client()
+        self._emit("INFO | LIVE | Arrancando cliente con start()")
         await self.client.start()
+        self._emit("INFO | LIVE | Cliente iniciado")
 
     async def _disconnect_client(self):
         if self.client:
             try:
                 if self.client.is_connected():
+                    self._emit("INFO | TELETHON | Desconectando cliente...")
                     await self.client.disconnect()
+                    self._emit("INFO | TELETHON | Cliente desconectado")
             except Exception:
                 logger.exception("Error cerrando cliente Telethon")
 
@@ -135,7 +149,7 @@ class TelegramSignalListener:
         msg_ts: int,
         text: str,
     ) -> int:
-        return insert_raw_message({
+        raw_msg_id = insert_raw_message({
             "channel_id": str(raw_chat_id),
             "channel_name": channel_name,
             "message_id": msg_id,
@@ -143,6 +157,8 @@ class TelegramSignalListener:
             "text": text,
             "raw_json": None,
         })
+        self._emit(f"INFO | DB | Raw message guardado msg_id={msg_id} raw_id={raw_msg_id} canal={channel_name}")
+        return raw_msg_id
 
     def _post_process_signals(
         self,
@@ -163,6 +179,7 @@ class TelegramSignalListener:
             sd["channel_name"] = channel_name
 
             action = sd.get("action", "")
+            self._emit(f"INFO | PARSER | Señal candidata action={action} symbol={sd.get('symbol')} dir={sd.get('direction')}")
 
             if action == "SL_MOVE":
                 sid = insert_sl_move(
@@ -171,13 +188,11 @@ class TelegramSignalListener:
                     sd.get("sl"),
                     reply_to_id or 0,
                 )
-                logger.info(
-                    "SL_MOVE id=%s canal=%s sl=%s symbol=%s",
-                    sid, channel_name, sd.get("sl"), sd.get("symbol")
-                )
+                self._emit(f"INFO | DB | SL_MOVE insertado id={sid} canal={channel_name} sl={sd.get('sl')}")
                 continue
 
             if action in ("TP_DONE",):
+                self._emit("INFO | PARSER | TP_DONE ignorado")
                 continue
 
             if action == "OPEN" and sd.get("tp1"):
@@ -187,6 +202,7 @@ class TelegramSignalListener:
                 )
                 if tp_final is not None:
                     sd["tp"] = tp_final
+                    self._emit(f"INFO | PARSER | TP final consolidado={tp_final} para msg={msg_id}")
 
             enriched.append(sd)
 
@@ -218,6 +234,9 @@ class TelegramSignalListener:
                     rev["execution_type"] = cfg["execution_type_rev"]
 
                 enriched.append(rev)
+                self._emit(
+                    f"INFO | PARSER | Señal inversa generada symbol={rev.get('symbol')} dir={rev.get('direction')} magic={rev.get('magic')}"
+                )
 
         return enriched
 
@@ -228,14 +247,9 @@ class TelegramSignalListener:
                 continue
 
             sid = insert_signal(sig)
-            logger.info(
-                "Signal id=%s action=%s symbol=%s dir=%s magic=%s channel=%s",
-                sid,
-                sig.get("action"),
-                sig.get("symbol"),
-                sig.get("direction"),
-                sig.get("magic"),
-                sig.get("channel_name"),
+            self._emit(
+                f"INFO | DB | Signal insertada id={sid} action={sig.get('action')} "
+                f"symbol={sig.get('symbol')} dir={sig.get('direction')} magic={sig.get('magic')}"
             )
             total += 1
         return total
@@ -257,12 +271,15 @@ class TelegramSignalListener:
         cfg = self._get_cfg_for_chat_id(raw_chat_id)
         if cfg is None:
             if not ignore_unconfigured:
-                logger.info("Canal no configurado chat_id=%s", raw_chat_id)
+                self._emit(f"INFO | LIVE | Canal no configurado chat_id={raw_chat_id}")
             return 0
 
         channel_name = cfg["channel_name"]
         reply_to_id = getattr(msg, "reply_to_msg_id", None)
         msg_ts = self._msg_ts(msg)
+
+        self._emit(f"INFO | MSG | Canal={channel_name} msg_id={msg.id} reply_to={reply_to_id}")
+        self._emit(f"INFO | MSG | Texto={repr(text[:300])}")
 
         raw_msg_id = self._store_raw_message(
             raw_chat_id=raw_chat_id,
@@ -272,7 +289,7 @@ class TelegramSignalListener:
             text=text,
         )
 
-        logger.info("[PARSE] canal=%s id=%s text=%r", channel_name, msg.id, text[:180])
+        self._emit(f"INFO | PARSER | Parseando mensaje msg_id={msg.id} canal={channel_name}")
 
         signals_raw = parse_universal(
             text,
@@ -282,8 +299,10 @@ class TelegramSignalListener:
         )
 
         if not signals_raw:
-            logger.info("[NONE] canal=%s id=%s", channel_name, msg.id)
+            self._emit(f"INFO | PARSER | Sin señal msg_id={msg.id} canal={channel_name}")
             return 0
+
+        self._emit(f"INFO | PARSER | Señales detectadas={len(signals_raw)} msg_id={msg.id}")
 
         enriched = self._post_process_signals(
             cfg=cfg,
@@ -295,8 +314,13 @@ class TelegramSignalListener:
 
         inserted = self._persist_signals(enriched)
 
+        if inserted == 0:
+            self._emit(f"INFO | PARSER | No se insertaron señales finales msg_id={msg.id}")
+        else:
+            self._emit(f"INFO | PARSER | Señales finales insertadas={inserted} msg_id={msg.id}")
+
         if progress_callback and inserted:
-            progress_callback(f"{channel_name}: msg {msg.id} -> {inserted} señal(es)")
+            progress_callback(f"INFO | REPLAY | {channel_name}: msg {msg.id} -> {inserted} señal(es)")
 
         return inserted
 
@@ -306,15 +330,16 @@ class TelegramSignalListener:
 
     async def _async_start_live(self):
         await self._start_client_for_live()
-        logger.info("Cliente Telethon v1 iniciado")
+        self._emit("INFO | LIVE | Cliente Telethon iniciado")
         self._register_handlers()
 
     def _register_handlers(self):
         @self.client.on(events.NewMessage())
         async def handler(event):
             try:
-                await self._process_message_obj(event.message)
+                await self._process_message_obj(event.message, ignore_unconfigured=False)
             except Exception as e:
+                self._emit(f"ERROR | LIVE | Error procesando mensaje: {e}")
                 logger.exception("Error procesando mensaje live: %s", e)
 
     def run_forever(self):
@@ -323,7 +348,7 @@ class TelegramSignalListener:
         self._ensure_client()
 
         self.loop.run_until_complete(self._async_start_live())
-        logger.info("Escuchando (v1 live)...")
+        self._emit("INFO | LIVE | Escuchando mensajes...")
         self.client.run_until_disconnected()
 
     # ------------------------------------------------------------------
@@ -344,7 +369,7 @@ class TelegramSignalListener:
 
         for channel_id in selected_channel_ids:
             if progress_callback:
-                progress_callback(f"Replay canal {channel_id}...")
+                progress_callback(f"INFO | REPLAY | Replay canal {channel_id}...")
 
             cfg = self._get_cfg_for_chat_id(channel_id)
             channel_name = cfg["channel_name"] if cfg else str(channel_id)
@@ -362,6 +387,7 @@ class TelegramSignalListener:
                         continue
 
                     total_messages += 1
+                    self._emit(f"INFO | REPLAY | Procesando canal={channel_name} msg_id={msg.id} fecha={msg_dt}")
 
                     inserted = await self._process_message_obj(
                         msg,
@@ -370,9 +396,9 @@ class TelegramSignalListener:
                     )
                     total_inserted += inserted
 
-                    if progress_callback and total_messages % 50 == 0:
+                    if progress_callback and total_messages % 25 == 0:
                         progress_callback(
-                            f"[{channel_name}] mensajes={total_messages} señales={total_inserted}"
+                            f"INFO | REPLAY | [{channel_name}] mensajes={total_messages} señales={total_inserted}"
                         )
 
             except Exception:
@@ -383,7 +409,7 @@ class TelegramSignalListener:
 
         if progress_callback:
             progress_callback(
-                f"Replay completado. Mensajes={total_messages}, señales={total_inserted}"
+                f"INFO | REPLAY | Replay completado. Mensajes={total_messages}, señales={total_inserted}"
             )
 
         return total_messages
@@ -414,10 +440,6 @@ class TelegramSignalListener:
                     self.loop.run_until_complete(self._disconnect_client())
             except Exception:
                 logger.exception("Error cerrando cliente tras replay")
-
-    # ------------------------------------------------------------------
-    # UTILIDAD OPCIONAL
-    # ------------------------------------------------------------------
 
     def close(self):
         try:

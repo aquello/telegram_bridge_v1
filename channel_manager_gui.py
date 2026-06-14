@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QStatusBar,
     QTableWidget,
@@ -177,7 +178,7 @@ class ChannelManagerWindow(QMainWindow):
 
     def _setup_ui(self):
         self.setWindowTitle("Telegram Trade Bridge · Channel Manager")
-        self.resize(1560, 940)
+        self.resize(1360, 820)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -278,11 +279,19 @@ class ChannelManagerWindow(QMainWindow):
         left_layout.addWidget(self.table)
         splitter.addWidget(left_panel)
 
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        right_scroll.setObjectName("RightScroll")
+
         right_panel = QFrame()
         right_panel.setObjectName("Panel")
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(16, 16, 16, 16)
         right_layout.setSpacing(14)
+
+        right_scroll.setWidget(right_panel)
 
         live_box = QFrame()
         live_box.setObjectName("InnerPanel")
@@ -409,8 +418,8 @@ class ChannelManagerWindow(QMainWindow):
         right_layout.addWidget(info_box)
         right_layout.addStretch(1)
 
-        splitter.addWidget(right_panel)
-        splitter.setSizes([1030, 500])
+        splitter.addWidget(right_scroll)
+        splitter.setSizes([980, 420])
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -528,6 +537,10 @@ class ChannelManagerWindow(QMainWindow):
         QStatusBar {
             background: #131720;
             color: #c7d0db;
+        }
+        QScrollArea {
+            border: none;
+            background: transparent;
         }
         """)
 

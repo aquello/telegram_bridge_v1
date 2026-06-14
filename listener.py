@@ -2,9 +2,9 @@ import asyncio
 import logging
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Dict, Optional, List, Callable
+from typing import Dict, Optional, List, Callable, Tuple
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 
 from .db import (
     get_channel_config_by_telegram_id,
@@ -95,15 +95,31 @@ class TelegramSignalListener:
             except Exception:
                 logger.exception("Error cerrando cliente Telethon")
 
-    def _resolve_lookup_ids(self, raw_chat_id: int) -> List[int]:
-        ids = [int(raw_chat_id)]
-        alt_id = -(1_000_000_000_000 + abs(int(raw_chat_id)))
-        if alt_id not in ids:
-            ids.append(alt_id)
+    def _build_lookup_ids(self, raw_chat_id: Optional[int], peer_chat_id: Optional[int]) -> List[int]:
+        ids: List[int] = []
+        for value in (peer_chat_id, raw_chat_id):
+            if value is None:
+                continue
+            value = int(value)
+            if value not in ids:
+                ids.append(value)
+
+        if raw_chat_id is not None:
+            raw_chat_id = int(raw_chat_id)
+            neg100 = int(f"-100{abs(raw_chat_id)}")
+            if neg100 not in ids:
+                ids.append(neg100)
+
+        if peer_chat_id is not None:
+            peer_chat_id = int(peer_chat_id)
+            peer_abs = abs(peer_chat_id)
+            if peer_abs not in ids:
+                ids.append(peer_abs)
+
         return ids
 
-    def _get_cfg_for_chat_id(self, raw_chat_id: int) -> Optional[Dict]:
-        for lookup_id in self._resolve_lookup_ids(raw_chat_id):
+    def _get_cfg_for_ids(self, lookup_ids: List[int]) -> Optional[Dict]:
+        for lookup_id in lookup_ids:
             cfg = get_channel_config_by_telegram_id(lookup_id)
             if cfg is not None:
                 return cfg
@@ -123,29 +139,38 @@ class TelegramSignalListener:
             return msg.date.astimezone(timezone.utc).replace(tzinfo=None)
         return msg.date
 
-    async def _extract_chat_id_and_name(self, msg):
+    async def _extract_chat_info(self, msg) -> Tuple[Optional[int], Optional[int], str]:
         chat = await msg.get_chat()
         raw_chat_id = getattr(chat, "id", None)
-        title = getattr(chat, "title", None) or getattr(chat, "username", None) or str(raw_chat_id)
-        return raw_chat_id, title
+
+        try:
+            peer_chat_id = utils.get_peer_id(chat)
+        except Exception:
+            peer_chat_id = None
+
+        title = getattr(chat, "title", None) or getattr(chat, "username", None) or str(raw_chat_id or peer_chat_id)
+        return raw_chat_id, peer_chat_id, title
 
     def _store_raw_message(
         self,
-        raw_chat_id: int,
+        channel_id_for_db: int,
         channel_name: str,
         msg_id: int,
         msg_ts: int,
         text: str,
     ) -> int:
         raw_msg_id = insert_raw_message({
-            "channel_id": str(raw_chat_id),
+            "channel_id": str(channel_id_for_db),
             "channel_name": channel_name,
             "message_id": msg_id,
             "date": msg_ts,
             "text": text,
             "raw_json": None,
         })
-        self._emit(f"INFO | DB | Raw message guardado raw_msg_id={raw_msg_id} msg_id={msg_id} canal={channel_name}")
+        self._emit(
+            f"INFO | DB | Raw message guardado raw_msg_id={raw_msg_id} "
+            f"msg_id={msg_id} canal={channel_name} channel_id={channel_id_for_db}"
+        )
         return raw_msg_id
 
     def _post_process_signals(
@@ -257,27 +282,32 @@ class TelegramSignalListener:
             self._emit(f"INFO | MSG | Mensaje vacío msg_id={msg.id}")
             return 0
 
-        raw_chat_id, fallback_title = await self._extract_chat_id_and_name(msg)
-        if raw_chat_id is None:
-            self._emit(f"WARN | MSG | No se pudo resolver chat_id msg_id={msg.id}")
-            return 0
+        raw_chat_id, peer_chat_id, fallback_title = await self._extract_chat_info(msg)
+        lookup_ids = self._build_lookup_ids(raw_chat_id, peer_chat_id)
 
-        cfg = self._get_cfg_for_chat_id(raw_chat_id)
+        self._emit(
+            f"INFO | MSG | IDs candidatos msg_id={msg.id} raw_chat_id={raw_chat_id} "
+            f"peer_chat_id={peer_chat_id} lookup_ids={lookup_ids}"
+        )
+
+        cfg = self._get_cfg_for_ids(lookup_ids)
         if cfg is None:
-            self._emit(f"INFO | MSG | Canal no configurado chat_id={raw_chat_id} msg_id={msg.id}")
-            if not ignore_unconfigured:
-                return 0
+            self._emit(
+                f"INFO | MSG | Canal no configurado msg_id={msg.id} "
+                f"raw_chat_id={raw_chat_id} peer_chat_id={peer_chat_id}"
+            )
             return 0
 
         channel_name = cfg["channel_name"]
         reply_to_id = getattr(msg, "reply_to_msg_id", None)
         msg_ts = self._msg_ts(msg)
+        channel_id_for_db = int(peer_chat_id if peer_chat_id is not None else raw_chat_id)
 
         self._emit(f"INFO | MSG | Canal={channel_name} msg_id={msg.id} reply_to={reply_to_id}")
         self._emit(f"INFO | MSG | Texto={repr(text[:300])}")
 
         raw_msg_id = self._store_raw_message(
-            raw_chat_id=raw_chat_id,
+            channel_id_for_db=channel_id_for_db,
             channel_name=channel_name or fallback_title,
             msg_id=msg.id,
             msg_ts=msg_ts,
@@ -358,7 +388,7 @@ class TelegramSignalListener:
             if progress_callback:
                 progress_callback(f"INFO | REPLAY | Replay canal {channel_id}...")
 
-            cfg = self._get_cfg_for_chat_id(channel_id)
+            cfg = get_channel_config_by_telegram_id(channel_id)
             channel_name = cfg["channel_name"] if cfg else str(channel_id)
 
             try:

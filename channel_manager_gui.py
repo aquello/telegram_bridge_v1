@@ -177,7 +177,7 @@ class ChannelManagerWindow(QMainWindow):
 
     def _setup_ui(self):
         self.setWindowTitle("Telegram Trade Bridge · Channel Manager")
-        self.resize(1520, 920)
+        self.resize(1560, 940)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -194,7 +194,7 @@ class ChannelManagerWindow(QMainWindow):
         title_box = QVBoxLayout()
         title = QLabel("Telegram Bridge")
         title.setObjectName("TitleLabel")
-        subtitle = QLabel("Configuración live y selección replay separadas")
+        subtitle = QLabel("Separación clara entre configuración live y selección replay")
         subtitle.setObjectName("SubtitleLabel")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
@@ -206,7 +206,7 @@ class ChannelManagerWindow(QMainWindow):
         self.btn_refresh = QPushButton("Refrescar canales")
         self.btn_show_configured = QPushButton("Ver solo configurados: No")
         self.btn_save = QPushButton("Guardar configuración live")
-        self.btn_start = QPushButton("Iniciar listener")
+        self.btn_start = QPushButton("Iniciar listener live")
 
         self.btn_show_configured.setCheckable(True)
 
@@ -227,6 +227,24 @@ class ChannelManagerWindow(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(12, 12, 12, 12)
         left_layout.setSpacing(10)
+
+        table_tools = QFrame()
+        table_tools.setObjectName("InnerPanel")
+        table_tools_layout = QHBoxLayout(table_tools)
+        table_tools_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.btn_replay_all_visible = QPushButton("Marcar replay visibles")
+        self.btn_replay_none = QPushButton("Quitar replay")
+        self.btn_replay_from_live = QPushButton("Replay = Live")
+        self.lbl_table_hint = QLabel("La columna Live se guarda en BBDD; Replay solo afecta a esta sesión.")
+
+        table_tools_layout.addWidget(self.btn_replay_all_visible)
+        table_tools_layout.addWidget(self.btn_replay_none)
+        table_tools_layout.addWidget(self.btn_replay_from_live)
+        table_tools_layout.addStretch()
+        table_tools_layout.addWidget(self.lbl_table_hint)
+
+        left_layout.addWidget(table_tools)
 
         self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels([
@@ -266,14 +284,20 @@ class ChannelManagerWindow(QMainWindow):
         right_layout.setContentsMargins(16, 16, 16, 16)
         right_layout.setSpacing(14)
 
-        section_title = QLabel("Configuración del canal")
-        section_title.setObjectName("SectionTitle")
-        right_layout.addWidget(section_title)
+        live_box = QFrame()
+        live_box.setObjectName("InnerPanel")
+        live_layout = QVBoxLayout(live_box)
+        live_layout.setContentsMargins(12, 12, 12, 12)
+        live_layout.setSpacing(10)
 
-        form_wrap = QWidget()
-        form = QFormLayout(form_wrap)
-        form.setContentsMargins(0, 0, 0, 0)
-        form.setSpacing(10)
+        live_title = QLabel("Configuración Live")
+        live_title.setObjectName("SectionTitle")
+        live_layout.addWidget(live_title)
+
+        live_form_wrap = QWidget()
+        live_form = QFormLayout(live_form_wrap)
+        live_form.setContentsMargins(0, 0, 0, 0)
+        live_form.setSpacing(10)
 
         self.lbl_selected_channel = QLabel("Sin selección")
         self.lbl_selected_channel.setObjectName("SelectedChannelLabel")
@@ -298,31 +322,44 @@ class ChannelManagerWindow(QMainWindow):
         self.input_risk.setPlaceholderText("2.0")
         self.input_risk.setText("2.0")
 
-        form.addRow("Canal", self.lbl_selected_channel)
-        form.addRow("", self.chk_live)
-        form.addRow("", self.chk_replay)
-        form.addRow("", self.chk_enabled)
-        form.addRow("Magic", self.input_magic)
-        form.addRow("", self.chk_reverse)
-        form.addRow("Magic inverso", self.input_magic_reverse)
-        form.addRow("Exec. normal", self.cmb_exec_type)
-        form.addRow("Exec. inversa", self.cmb_exec_type_rev)
-        form.addRow("Riesgo %", self.input_risk)
+        live_form.addRow("Canal", self.lbl_selected_channel)
+        live_form.addRow("", self.chk_live)
+        live_form.addRow("", self.chk_enabled)
+        live_form.addRow("Magic", self.input_magic)
+        live_form.addRow("", self.chk_reverse)
+        live_form.addRow("Magic inverso", self.input_magic_reverse)
+        live_form.addRow("Exec. normal", self.cmb_exec_type)
+        live_form.addRow("Exec. inversa", self.cmb_exec_type_rev)
+        live_form.addRow("Riesgo %", self.input_risk)
 
-        right_layout.addWidget(form_wrap)
+        live_layout.addWidget(live_form_wrap)
 
-        actions = QHBoxLayout()
-        self.btn_apply_row = QPushButton("Aplicar a esta fila")
+        live_actions = QHBoxLayout()
+        self.btn_apply_row = QPushButton("Aplicar cambios fila")
         self.btn_reload_row = QPushButton("Recargar fila")
-        actions.addWidget(self.btn_apply_row)
-        actions.addWidget(self.btn_reload_row)
-        right_layout.addLayout(actions)
+        live_actions.addWidget(self.btn_apply_row)
+        live_actions.addWidget(self.btn_reload_row)
+        live_layout.addLayout(live_actions)
+
+        right_layout.addWidget(live_box)
 
         replay_box = QFrame()
-        replay_box.setObjectName("Panel")
-        replay_layout = QFormLayout(replay_box)
+        replay_box.setObjectName("InnerPanel")
+        replay_layout = QVBoxLayout(replay_box)
         replay_layout.setContentsMargins(12, 12, 12, 12)
         replay_layout.setSpacing(10)
+
+        replay_title = QLabel("Replay")
+        replay_title.setObjectName("SectionTitle")
+        replay_layout.addWidget(replay_title)
+
+        replay_form_wrap = QWidget()
+        replay_form = QFormLayout(replay_form_wrap)
+        replay_form.setContentsMargins(0, 0, 0, 0)
+        replay_form.setSpacing(10)
+
+        self.chk_replay_editor = QCheckBox("Seleccionar este canal para replay")
+        self.chk_replay_editor.setChecked(False)
 
         self.date_from = QDateEdit()
         self.date_from.setCalendarPopup(True)
@@ -351,18 +388,21 @@ class ChannelManagerWindow(QMainWindow):
 
         self.btn_start_replay = QPushButton("Lanzar replay")
 
-        replay_layout.addRow("Desde", self.date_from)
-        replay_layout.addRow("", self.chk_date_to)
-        replay_layout.addRow("Hasta", self.date_to)
-        replay_layout.addRow("BBDD destino", db_wrap)
-        replay_layout.addRow("", self.btn_start_replay)
+        replay_form.addRow("", self.chk_replay_editor)
+        replay_form.addRow("Desde", self.date_from)
+        replay_form.addRow("", self.chk_date_to)
+        replay_form.addRow("Hasta", self.date_to)
+        replay_form.addRow("BBDD destino", db_wrap)
+
+        replay_layout.addWidget(replay_form_wrap)
+        replay_layout.addWidget(self.btn_start_replay)
 
         right_layout.addWidget(replay_box)
 
         info_box = QLabel(
-            "Live y Replay están separados.\n"
-            "Guardar configuración solo afecta a channel_config (modo live).\n"
-            "Replay usa únicamente los canales marcados en la columna Replay."
+            "Live y Replay están desacoplados.\n"
+            "Guardar configuración solo afecta a channel_config.\n"
+            "La selección Replay no toca la configuración persistente y sirve para depuración histórica."
         )
         info_box.setWordWrap(True)
         info_box.setObjectName("InfoBox")
@@ -370,7 +410,7 @@ class ChannelManagerWindow(QMainWindow):
         right_layout.addStretch(1)
 
         splitter.addWidget(right_panel)
-        splitter.setSizes([1030, 470])
+        splitter.setSizes([1030, 500])
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -390,6 +430,10 @@ class ChannelManagerWindow(QMainWindow):
         self.btn_browse_db.clicked.connect(self.browse_db_path)
         self.btn_start_replay.clicked.connect(self.start_replay)
 
+        self.btn_replay_all_visible.clicked.connect(self.mark_replay_all_visible)
+        self.btn_replay_none.clicked.connect(self.unmark_replay_all)
+        self.btn_replay_from_live.clicked.connect(self.copy_live_to_replay)
+
         self._build_menu()
         self._apply_styles()
 
@@ -404,10 +448,13 @@ class ChannelManagerWindow(QMainWindow):
         QMainWindow {
             background: #0f1115;
         }
-        #TopBar, #Panel {
+        #TopBar, #Panel, #InnerPanel {
             background: #171a21;
             border: 1px solid #252b36;
             border-radius: 14px;
+        }
+        #InnerPanel {
+            background: #141820;
         }
         #TitleLabel {
             font-size: 24px;
@@ -490,6 +537,9 @@ class ChannelManagerWindow(QMainWindow):
         self.btn_save.setEnabled(not busy)
         self.btn_start.setEnabled(not busy)
         self.btn_start_replay.setEnabled(not busy)
+        self.btn_replay_all_visible.setEnabled(not busy)
+        self.btn_replay_none.setEnabled(not busy)
+        self.btn_replay_from_live.setEnabled(not busy)
         if message:
             self.status.showMessage(message)
 
@@ -569,19 +619,24 @@ class ChannelManagerWindow(QMainWindow):
 
         self.rows = rows
 
-    def _render_table(self):
-        self.table.blockSignals(True)
-
+    def _get_visible_real_indexes(self) -> List[int]:
         show_only = self.btn_show_configured.isChecked()
         visible_rows = []
         for idx, r in enumerate(self.rows):
             if show_only and not r.configured:
                 continue
-            visible_rows.append((idx, r))
+            visible_rows.append(idx)
+        return visible_rows
 
-        self.table.setRowCount(len(visible_rows))
+    def _render_table(self):
+        self.table.blockSignals(True)
 
-        for table_row, (real_idx, row) in enumerate(visible_rows):
+        visible_indexes = self._get_visible_real_indexes()
+        self.table.setRowCount(len(visible_indexes))
+
+        for table_row, real_idx in enumerate(visible_indexes):
+            row = self.rows[real_idx]
+
             live_item = QTableWidgetItem()
             live_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             live_item.setCheckState(Qt.Checked if row.selected_live else Qt.Unchecked)
@@ -657,6 +712,9 @@ class ChannelManagerWindow(QMainWindow):
         elif item.column() == 1:
             row.selected_replay = item.checkState() == Qt.Checked
 
+        if self.selected_row_index == int(real_idx):
+            self.load_current_row_into_editor()
+
     def load_current_row_into_editor(self):
         if self.selected_row_index is None:
             return
@@ -665,6 +723,7 @@ class ChannelManagerWindow(QMainWindow):
         self.lbl_selected_channel.setText(f"{row.channel_name} · {row.telegram_id}")
         self.chk_live.setChecked(row.selected_live)
         self.chk_replay.setChecked(row.selected_replay)
+        self.chk_replay_editor.setChecked(row.selected_replay)
         self.chk_enabled.setChecked(row.enabled)
         self.input_magic.setText(row.magic)
         self.chk_reverse.setChecked(row.enable_reverse)
@@ -680,7 +739,7 @@ class ChannelManagerWindow(QMainWindow):
 
         row = self.rows[self.selected_row_index]
         row.selected_live = self.chk_live.isChecked()
-        row.selected_replay = self.chk_replay.isChecked()
+        row.selected_replay = self.chk_replay.isChecked() or self.chk_replay_editor.isChecked()
         row.enabled = self.chk_enabled.isChecked()
         row.magic = self.input_magic.text().strip()
         row.enable_reverse = self.chk_reverse.isChecked()
@@ -759,6 +818,45 @@ class ChannelManagerWindow(QMainWindow):
 
     def _get_replay_channel_ids(self) -> List[int]:
         return [r.telegram_id for r in self.rows if r.selected_replay]
+
+    def mark_replay_all_visible(self):
+        if self.selected_row_index is not None:
+            self.apply_editor_to_current_row()
+
+        count = 0
+        for idx in self._get_visible_real_indexes():
+            self.rows[idx].selected_replay = True
+            count += 1
+
+        self._render_table()
+        self.status.showMessage(f"Canales marcados para replay: {count}")
+
+    def unmark_replay_all(self):
+        if self.selected_row_index is not None:
+            self.apply_editor_to_current_row()
+
+        for row in self.rows:
+            row.selected_replay = False
+
+        self._render_table()
+        if self.selected_row_index is not None:
+            self.load_current_row_into_editor()
+        self.status.showMessage("Selección replay limpiada")
+
+    def copy_live_to_replay(self):
+        if self.selected_row_index is not None:
+            self.apply_editor_to_current_row()
+
+        count = 0
+        for row in self.rows:
+            row.selected_replay = bool(row.selected_live)
+            if row.selected_replay:
+                count += 1
+
+        self._render_table()
+        if self.selected_row_index is not None:
+            self.load_current_row_into_editor()
+        self.status.showMessage(f"Replay sincronizado con Live: {count} canales")
 
     def start_listener(self):
         try:

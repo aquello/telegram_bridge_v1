@@ -3,9 +3,29 @@ import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 
+
 DB_PATH_REAL = r"C:\Users\AdmVps\AppData\Roaming\MetaQuotes\Terminal\Common\Files\signals.db"
 DB_PATH_BT = os.path.join(os.path.dirname(DB_PATH_REAL), "signals_bt.db")
 DB_PATH = DB_PATH_REAL
+
+
+def _ensure_parent_dir(path: str):
+    folder = os.path.dirname(os.path.abspath(path))
+    if folder and not os.path.exists(folder):
+        os.makedirs(folder, exist_ok=True)
+
+
+def set_db_path(path: str):
+    global DB_PATH
+    if not path or not path.strip():
+        raise ValueError("La ruta de BBDD no puede estar vacía.")
+    abs_path = os.path.abspath(path.strip())
+    _ensure_parent_dir(abs_path)
+    DB_PATH = abs_path
+
+
+def get_db_path() -> str:
+    return DB_PATH
 
 
 def use_backtest_db():
@@ -19,6 +39,7 @@ def use_real_db():
 
 
 def get_connection() -> sqlite3.Connection:
+    _ensure_parent_dir(DB_PATH)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -123,6 +144,9 @@ ON channel_config(enabled);
 
 CREATE INDEX IF NOT EXISTS idx_signals_channel_name
 ON signals(channel_name);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_messages_unique
+ON raw_messages(channel_id, message_id);
 """
 
 _MIGRATIONS = [
@@ -164,12 +188,24 @@ def init_schema():
     conn.close()
 
 
+def raw_message_exists(channel_id: str, message_id: int) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM raw_messages WHERE channel_id=? AND message_id=? LIMIT 1",
+        (channel_id, message_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
 def insert_raw_message(data: Dict[str, Any]) -> int:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO raw_messages (
+        INSERT OR IGNORE INTO raw_messages (
             channel_id, channel_name, message_id, date, text, raw_json
         ) VALUES (
             :channel_id, :channel_name, :message_id, :date, :text, :raw_json
@@ -177,8 +213,16 @@ def insert_raw_message(data: Dict[str, Any]) -> int:
         """,
         data,
     )
+    if cur.lastrowid:
+        rid = cur.lastrowid
+    else:
+        cur.execute(
+            "SELECT id FROM raw_messages WHERE channel_id=? AND message_id=?",
+            (data["channel_id"], data["message_id"]),
+        )
+        row = cur.fetchone()
+        rid = row["id"]
     conn.commit()
-    rid = cur.lastrowid
     conn.close()
     return rid
 

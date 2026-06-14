@@ -38,10 +38,6 @@ class TelegramSignalListener:
         if self.progress_callback:
             self.progress_callback(text)
 
-    # ------------------------------------------------------------------
-    # LOOP / CLIENT
-    # ------------------------------------------------------------------
-
     def _ensure_loop(self):
         try:
             loop = asyncio.get_running_loop()
@@ -99,10 +95,6 @@ class TelegramSignalListener:
             except Exception:
                 logger.exception("Error cerrando cliente Telethon")
 
-    # ------------------------------------------------------------------
-    # HELPERS
-    # ------------------------------------------------------------------
-
     def _resolve_lookup_ids(self, raw_chat_id: int) -> List[int]:
         ids = [int(raw_chat_id)]
         alt_id = -(1_000_000_000_000 + abs(int(raw_chat_id)))
@@ -137,10 +129,6 @@ class TelegramSignalListener:
         title = getattr(chat, "title", None) or getattr(chat, "username", None) or str(raw_chat_id)
         return raw_chat_id, title
 
-    # ------------------------------------------------------------------
-    # CORE MESSAGE PROCESS
-    # ------------------------------------------------------------------
-
     def _store_raw_message(
         self,
         raw_chat_id: int,
@@ -157,7 +145,7 @@ class TelegramSignalListener:
             "text": text,
             "raw_json": None,
         })
-        self._emit(f"INFO | DB | Raw message guardado msg_id={msg_id} raw_id={raw_msg_id} canal={channel_name}")
+        self._emit(f"INFO | DB | Raw message guardado raw_msg_id={raw_msg_id} msg_id={msg_id} canal={channel_name}")
         return raw_msg_id
 
     def _post_process_signals(
@@ -179,7 +167,10 @@ class TelegramSignalListener:
             sd["channel_name"] = channel_name
 
             action = sd.get("action", "")
-            self._emit(f"INFO | PARSER | Señal candidata action={action} symbol={sd.get('symbol')} dir={sd.get('direction')}")
+            self._emit(
+                f"INFO | PARSER | Señal candidata action={action} symbol={sd.get('symbol')} "
+                f"dir={sd.get('direction')} magic={sd.get('magic')}"
+            )
 
             if action == "SL_MOVE":
                 sid = insert_sl_move(
@@ -202,7 +193,7 @@ class TelegramSignalListener:
                 )
                 if tp_final is not None:
                     sd["tp"] = tp_final
-                    self._emit(f"INFO | PARSER | TP final consolidado={tp_final} para msg={msg_id}")
+                    self._emit(f"INFO | PARSER | TP final consolidado={tp_final} msg_id={msg_id}")
 
             enriched.append(sd)
 
@@ -235,7 +226,8 @@ class TelegramSignalListener:
 
                 enriched.append(rev)
                 self._emit(
-                    f"INFO | PARSER | Señal inversa generada symbol={rev.get('symbol')} dir={rev.get('direction')} magic={rev.get('magic')}"
+                    f"INFO | PARSER | Señal inversa generada symbol={rev.get('symbol')} "
+                    f"dir={rev.get('direction')} magic={rev.get('magic')}"
                 )
 
         return enriched
@@ -262,16 +254,19 @@ class TelegramSignalListener:
     ) -> int:
         text = msg.message or ""
         if not text.strip():
+            self._emit(f"INFO | MSG | Mensaje vacío msg_id={msg.id}")
             return 0
 
         raw_chat_id, fallback_title = await self._extract_chat_id_and_name(msg)
         if raw_chat_id is None:
+            self._emit(f"WARN | MSG | No se pudo resolver chat_id msg_id={msg.id}")
             return 0
 
         cfg = self._get_cfg_for_chat_id(raw_chat_id)
         if cfg is None:
+            self._emit(f"INFO | MSG | Canal no configurado chat_id={raw_chat_id} msg_id={msg.id}")
             if not ignore_unconfigured:
-                self._emit(f"INFO | LIVE | Canal no configurado chat_id={raw_chat_id}")
+                return 0
             return 0
 
         channel_name = cfg["channel_name"]
@@ -298,11 +293,11 @@ class TelegramSignalListener:
             tg_reply_to_id=reply_to_id,
         )
 
+        self._emit(f"INFO | PARSER | parse_universal devolvió {len(signals_raw) if signals_raw else 0} resultado(s)")
+
         if not signals_raw:
             self._emit(f"INFO | PARSER | Sin señal msg_id={msg.id} canal={channel_name}")
             return 0
-
-        self._emit(f"INFO | PARSER | Señales detectadas={len(signals_raw)} msg_id={msg.id}")
 
         enriched = self._post_process_signals(
             cfg=cfg,
@@ -323,10 +318,6 @@ class TelegramSignalListener:
             progress_callback(f"INFO | REPLAY | {channel_name}: msg {msg.id} -> {inserted} señal(es)")
 
         return inserted
-
-    # ------------------------------------------------------------------
-    # LIVE
-    # ------------------------------------------------------------------
 
     async def _async_start_live(self):
         await self._start_client_for_live()
@@ -350,10 +341,6 @@ class TelegramSignalListener:
         self.loop.run_until_complete(self._async_start_live())
         self._emit("INFO | LIVE | Escuchando mensajes...")
         self.client.run_until_disconnected()
-
-    # ------------------------------------------------------------------
-    # REPLAY
-    # ------------------------------------------------------------------
 
     async def _async_run_replay(
         self,
@@ -391,7 +378,7 @@ class TelegramSignalListener:
 
                     inserted = await self._process_message_obj(
                         msg,
-                        progress_callback=None,
+                        progress_callback=progress_callback,
                         ignore_unconfigured=True,
                     )
                     total_inserted += inserted

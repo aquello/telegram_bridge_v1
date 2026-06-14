@@ -2,14 +2,17 @@ import logging
 import sys
 import traceback
 from dataclasses import dataclass
+from datetime import datetime, time
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QDate, QThread, Signal
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDateEdit,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -28,7 +31,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .db import get_channel_config_map, init_schema, upsert_channel_config, disable_channel_config
+from .db import (
+    DB_PATH_BT,
+    DB_PATH_REAL,
+    disable_channel_config,
+    get_channel_config_map,
+    init_schema,
+    set_db_path,
+    upsert_channel_config,
+)
 from .listener import TelegramSignalListener
 from .telegram_service import TelegramDialogInfo, TelegramDialogService
 
@@ -37,7 +48,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RowState:
-    selected: bool = False
+    selected_live: bool = False
+    selected_replay: bool = False
     enabled: bool = True
     channel_name: str = ""
     telegram_id: int = 0
@@ -87,17 +99,62 @@ class ListenerWorker(QThread):
     status_text = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, api_id: int, api_hash: str, session_name: str = "tg_session_v1"):
+    def __init__(self, api_id: int, api_hash: str, session_name: str = "tg_session_v1", db_path: Optional[str] = None):
         super().__init__()
         self.api_id = api_id
         self.api_hash = api_hash
         self.session_name = session_name
+        self.db_path = db_path
 
     def run(self):
         try:
-            self.status_text.emit("Iniciando listener...")
+            if self.db_path:
+                set_db_path(self.db_path)
+                init_schema()
+            self.status_text.emit("Iniciando listener live...")
             listener = TelegramSignalListener(self.api_id, self.api_hash, session_name=self.session_name)
             listener.run_forever()
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class ReplayWorker(QThread):
+    status_text = Signal(str)
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        api_id: int,
+        api_hash: str,
+        session_name: str,
+        selected_channel_ids: List[int],
+        date_from: datetime,
+        date_to: Optional[datetime],
+        db_path: str,
+    ):
+        super().__init__()
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.session_name = session_name
+        self.selected_channel_ids = selected_channel_ids
+        self.date_from = date_from
+        self.date_to = date_to
+        self.db_path = db_path
+
+    def run(self):
+        try:
+            set_db_path(self.db_path)
+            init_schema()
+            self.status_text.emit(f"Replay usando DB: {self.db_path}")
+            listener = TelegramSignalListener(self.api_id, self.api_hash, session_name=self.session_name)
+            total = listener.run_replay(
+                selected_channel_ids=self.selected_channel_ids,
+                date_from=self.date_from,
+                date_to=self.date_to,
+                progress_callback=self.status_text.emit,
+            )
+            self.finished_ok.emit(f"Replay finalizado. Mensajes procesados: {total}")
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -114,6 +171,7 @@ class ChannelManagerWindow(QMainWindow):
         self.dialogs: List[TelegramDialogInfo] = []
         self.selected_row_index: Optional[int] = None
         self.listener_worker: Optional[ListenerWorker] = None
+        self.replay_worker: Optional[ReplayWorker] = None
         self.load_worker: Optional[LoadDialogsWorker] = None
         self.test_worker: Optional[TestConnectionWorker] = None
 
@@ -140,7 +198,7 @@ class ChannelManagerWindow(QMainWindow):
         title_box = QVBoxLayout()
         title = QLabel("Telegram Bridge")
         title.setObjectName("TitleLabel")
-        subtitle = QLabel("Gestión visual de canales y configuración persistente por telegram_id")
+        subtitle = QLabel("Gestión visual de canales, live y replay/backtesting")
         subtitle.setObjectName("SubtitleLabel")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
@@ -151,8 +209,8 @@ class ChannelManagerWindow(QMainWindow):
         self.btn_test = QPushButton("Probar conexión Telegram")
         self.btn_refresh = QPushButton("Refrescar canales")
         self.btn_show_configured = QPushButton("Ver solo configurados: No")
-        self.btn_save = QPushButton("Guardar configuración")
-        self.btn_start = QPushButton("Iniciar listener")
+        self.btn_save = QPushButton("Guardar configuración live")
+        self.btn_start = QPushButton("Iniciar listener live")
 
         self.btn_show_configured.setCheckable(True)
 
@@ -174,9 +232,28 @@ class ChannelManagerWindow(QMainWindow):
         left_layout.setContentsMargins(12, 12, 12, 12)
         left_layout.setSpacing(10)
 
-        self.table = QTableWidget(0, 9)
+        table_tools = QFrame()
+        table_tools.setObjectName("InnerPanel")
+        table_tools_layout = QHBoxLayout(table_tools)
+        table_tools_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.btn_replay_all_visible = QPushButton("Marcar replay visibles")
+        self.btn_replay_none = QPushButton("Quitar replay")
+        self.btn_replay_from_live = QPushButton("Replay = Live")
+        self.lbl_table_hint = QLabel("Live se guarda en BBDD; Replay solo afecta a esta sesión.")
+
+        table_tools_layout.addWidget(self.btn_replay_all_visible)
+        table_tools_layout.addWidget(self.btn_replay_none)
+        table_tools_layout.addWidget(self.btn_replay_from_live)
+        table_tools_layout.addStretch()
+        table_tools_layout.addWidget(self.lbl_table_hint)
+
+        left_layout.addWidget(table_tools)
+
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels([
-            "Sel",
+            "Live",
+            "Replay",
             "Canal",
             "Telegram ID",
             "Tipo",
@@ -192,14 +269,15 @@ class ChannelManagerWindow(QMainWindow):
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeToContents)
 
         left_layout.addWidget(self.table)
         splitter.addWidget(left_panel)
@@ -218,20 +296,27 @@ class ChannelManagerWindow(QMainWindow):
 
         right_scroll.setWidget(right_panel)
 
-        section_title = QLabel("Configuración del canal")
-        section_title.setObjectName("SectionTitle")
-        right_layout.addWidget(section_title)
+        live_box = QFrame()
+        live_box.setObjectName("InnerPanel")
+        live_layout = QVBoxLayout(live_box)
+        live_layout.setContentsMargins(12, 12, 12, 12)
+        live_layout.setSpacing(10)
 
-        form_wrap = QWidget()
-        form = QFormLayout(form_wrap)
-        form.setContentsMargins(0, 0, 0, 0)
-        form.setSpacing(10)
+        live_title = QLabel("Configuración Live")
+        live_title.setObjectName("SectionTitle")
+        live_layout.addWidget(live_title)
+
+        live_form_wrap = QWidget()
+        live_form = QFormLayout(live_form_wrap)
+        live_form.setContentsMargins(0, 0, 0, 0)
+        live_form.setSpacing(10)
 
         self.lbl_selected_channel = QLabel("Sin selección")
         self.lbl_selected_channel.setObjectName("SelectedChannelLabel")
 
+        self.chk_live = QCheckBox("Activo en modo live")
+        self.chk_replay = QCheckBox("Seleccionar para replay")
         self.chk_enabled = QCheckBox("Canal activo")
-        self.chk_selected = QCheckBox("Seleccionar este canal")
         self.input_magic = QLineEdit()
         self.input_magic.setPlaceholderText("Ej: 1001")
 
@@ -249,29 +334,87 @@ class ChannelManagerWindow(QMainWindow):
         self.input_risk.setPlaceholderText("2.0")
         self.input_risk.setText("2.0")
 
-        form.addRow("Canal", self.lbl_selected_channel)
-        form.addRow("", self.chk_selected)
-        form.addRow("", self.chk_enabled)
-        form.addRow("Magic", self.input_magic)
-        form.addRow("", self.chk_reverse)
-        form.addRow("Magic inverso", self.input_magic_reverse)
-        form.addRow("Exec. normal", self.cmb_exec_type)
-        form.addRow("Exec. inversa", self.cmb_exec_type_rev)
-        form.addRow("Riesgo %", self.input_risk)
+        live_form.addRow("Canal", self.lbl_selected_channel)
+        live_form.addRow("", self.chk_live)
+        live_form.addRow("", self.chk_enabled)
+        live_form.addRow("Magic", self.input_magic)
+        live_form.addRow("", self.chk_reverse)
+        live_form.addRow("Magic inverso", self.input_magic_reverse)
+        live_form.addRow("Exec. normal", self.cmb_exec_type)
+        live_form.addRow("Exec. inversa", self.cmb_exec_type_rev)
+        live_form.addRow("Riesgo %", self.input_risk)
 
-        right_layout.addWidget(form_wrap)
+        live_layout.addWidget(live_form_wrap)
 
-        actions = QHBoxLayout()
-        self.btn_apply_row = QPushButton("Aplicar a esta fila")
+        live_actions = QHBoxLayout()
+        self.btn_apply_row = QPushButton("Aplicar cambios fila")
         self.btn_reload_row = QPushButton("Recargar fila")
-        actions.addWidget(self.btn_apply_row)
-        actions.addWidget(self.btn_reload_row)
-        right_layout.addLayout(actions)
+        live_actions.addWidget(self.btn_apply_row)
+        live_actions.addWidget(self.btn_reload_row)
+        live_layout.addLayout(live_actions)
+
+        right_layout.addWidget(live_box)
+
+        replay_box = QFrame()
+        replay_box.setObjectName("InnerPanel")
+        replay_layout = QVBoxLayout(replay_box)
+        replay_layout.setContentsMargins(12, 12, 12, 12)
+        replay_layout.setSpacing(10)
+
+        replay_title = QLabel("Replay / Backtesting")
+        replay_title.setObjectName("SectionTitle")
+        replay_layout.addWidget(replay_title)
+
+        replay_form_wrap = QWidget()
+        replay_form = QFormLayout(replay_form_wrap)
+        replay_form.setContentsMargins(0, 0, 0, 0)
+        replay_form.setSpacing(10)
+
+        self.chk_replay_editor = QCheckBox("Seleccionar este canal para replay")
+        self.chk_replay_editor.setChecked(False)
+
+        self.date_from = QDateEdit()
+        self.date_from.setCalendarPopup(True)
+        self.date_from.setDisplayFormat("yyyy-MM-dd")
+        self.date_from.setDate(QDate.currentDate().addDays(-7))
+
+        self.date_to = QDateEdit()
+        self.date_to.setCalendarPopup(True)
+        self.date_to.setDisplayFormat("yyyy-MM-dd")
+        self.date_to.setDate(QDate.currentDate())
+
+        self.chk_date_to = QCheckBox("Usar fecha hasta")
+        self.chk_date_to.setChecked(False)
+        self.date_to.setEnabled(False)
+
+        self.input_db_path = QLineEdit()
+        self.input_db_path.setText(DB_PATH_BT)
+        self.btn_browse_db = QPushButton("Examinar...")
+
+        db_row = QHBoxLayout()
+        db_row.addWidget(self.input_db_path, 1)
+        db_row.addWidget(self.btn_browse_db)
+
+        db_wrap = QWidget()
+        db_wrap.setLayout(db_row)
+
+        self.btn_start_replay = QPushButton("Lanzar replay")
+
+        replay_form.addRow("", self.chk_replay_editor)
+        replay_form.addRow("Desde", self.date_from)
+        replay_form.addRow("", self.chk_date_to)
+        replay_form.addRow("Hasta", self.date_to)
+        replay_form.addRow("BBDD destino", db_wrap)
+
+        replay_layout.addWidget(replay_form_wrap)
+        replay_layout.addWidget(self.btn_start_replay)
+
+        right_layout.addWidget(replay_box)
 
         info_box = QLabel(
-            "Marca los canales que quieres usar, asigna magic y guarda. "
-            "La configuración se persiste en channel_config para que al reiniciar "
-            "ya aparezcan como configurados."
+            "Live y Replay están desacoplados.\n"
+            "Guardar configuración solo afecta a channel_config.\n"
+            "La selección Replay no toca la configuración persistente y sirve para depuración histórica."
         )
         info_box.setWordWrap(True)
         info_box.setObjectName("InfoBox")
@@ -295,6 +438,14 @@ class ChannelManagerWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self.on_table_selection_changed)
         self.table.itemChanged.connect(self.on_table_item_changed)
 
+        self.chk_date_to.toggled.connect(self.date_to.setEnabled)
+        self.btn_browse_db.clicked.connect(self.browse_db_path)
+        self.btn_start_replay.clicked.connect(self.start_replay)
+
+        self.btn_replay_all_visible.clicked.connect(self.mark_replay_all_visible)
+        self.btn_replay_none.clicked.connect(self.unmark_replay_all)
+        self.btn_replay_from_live.clicked.connect(self.copy_live_to_replay)
+
         self._build_menu()
         self._apply_styles()
 
@@ -309,10 +460,13 @@ class ChannelManagerWindow(QMainWindow):
         QMainWindow {
             background: #0f1115;
         }
-        #TopBar, #Panel {
+        #TopBar, #Panel, #InnerPanel {
             background: #171a21;
             border: 1px solid #252b36;
             border-radius: 14px;
+        }
+        #InnerPanel {
+            background: #141820;
         }
         #TitleLabel {
             font-size: 24px;
@@ -353,7 +507,7 @@ class ChannelManagerWindow(QMainWindow):
         QPushButton:pressed {
             background: #1f2531;
         }
-        QLineEdit, QComboBox {
+        QLineEdit, QComboBox, QDateEdit {
             background: #0f1319;
             color: #eef2f7;
             border: 1px solid #313948;
@@ -405,6 +559,12 @@ class ChannelManagerWindow(QMainWindow):
     def set_busy(self, busy: bool, message: str = ""):
         self.btn_refresh.setEnabled(not busy)
         self.btn_test.setEnabled(not busy)
+        self.btn_save.setEnabled(not busy)
+        self.btn_start.setEnabled(not busy)
+        self.btn_start_replay.setEnabled(not busy)
+        self.btn_replay_all_visible.setEnabled(not busy)
+        self.btn_replay_none.setEnabled(not busy)
+        self.btn_replay_from_live.setEnabled(not busy)
         if message:
             self.status.showMessage(message)
 
@@ -449,7 +609,8 @@ class ChannelManagerWindow(QMainWindow):
             if cfg:
                 rows.append(
                     RowState(
-                        selected=bool(cfg.get("enabled", 0)),
+                        selected_live=bool(cfg.get("enabled", 0)),
+                        selected_replay=False,
                         enabled=bool(cfg.get("enabled", 0)),
                         channel_name=cfg.get("channel_name") or d.title,
                         telegram_id=int(d.telegram_id),
@@ -466,7 +627,8 @@ class ChannelManagerWindow(QMainWindow):
             else:
                 rows.append(
                     RowState(
-                        selected=False,
+                        selected_live=False,
+                        selected_replay=False,
                         enabled=True,
                         channel_name=d.title,
                         telegram_id=int(d.telegram_id),
@@ -483,57 +645,68 @@ class ChannelManagerWindow(QMainWindow):
 
         self.rows = rows
 
-    def _render_table(self):
-        self.table.blockSignals(True)
-
+    def _get_visible_real_indexes(self) -> List[int]:
         show_only = self.btn_show_configured.isChecked()
         visible_rows = []
         for idx, r in enumerate(self.rows):
             if show_only and not r.configured:
                 continue
-            visible_rows.append((idx, r))
+            visible_rows.append(idx)
+        return visible_rows
 
-        self.table.setRowCount(len(visible_rows))
+    def _render_table(self):
+        self.table.blockSignals(True)
 
-        for table_row, (real_idx, row) in enumerate(visible_rows):
-            chk_item = QTableWidgetItem()
-            chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            chk_item.setCheckState(Qt.Checked if row.selected else Qt.Unchecked)
-            chk_item.setData(Qt.UserRole, real_idx)
-            self.table.setItem(table_row, 0, chk_item)
+        visible_indexes = self._get_visible_real_indexes()
+        self.table.setRowCount(len(visible_indexes))
+
+        for table_row, real_idx in enumerate(visible_indexes):
+            row = self.rows[real_idx]
+
+            live_item = QTableWidgetItem()
+            live_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            live_item.setCheckState(Qt.Checked if row.selected_live else Qt.Unchecked)
+            live_item.setData(Qt.UserRole, real_idx)
+            self.table.setItem(table_row, 0, live_item)
+
+            replay_item = QTableWidgetItem()
+            replay_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            replay_item.setCheckState(Qt.Checked if row.selected_replay else Qt.Unchecked)
+            replay_item.setData(Qt.UserRole, real_idx)
+            self.table.setItem(table_row, 1, replay_item)
 
             name_item = QTableWidgetItem(row.channel_name)
             name_item.setData(Qt.UserRole, real_idx)
-            self.table.setItem(table_row, 1, name_item)
+            self.table.setItem(table_row, 2, name_item)
 
             id_item = QTableWidgetItem(str(row.telegram_id))
             id_item.setData(Qt.UserRole, real_idx)
-            self.table.setItem(table_row, 2, id_item)
+            self.table.setItem(table_row, 3, id_item)
 
             type_item = QTableWidgetItem(row.entity_type)
             type_item.setData(Qt.UserRole, real_idx)
-            self.table.setItem(table_row, 3, type_item)
+            self.table.setItem(table_row, 4, type_item)
 
             magic_item = QTableWidgetItem(row.magic)
             magic_item.setData(Qt.UserRole, real_idx)
-            self.table.setItem(table_row, 4, magic_item)
+            self.table.setItem(table_row, 5, magic_item)
 
             rev_item = QTableWidgetItem("Sí" if row.enable_reverse else "No")
             rev_item.setData(Qt.UserRole, real_idx)
-            self.table.setItem(table_row, 5, rev_item)
+            self.table.setItem(table_row, 6, rev_item)
 
             magic_rev_item = QTableWidgetItem(row.magic_reverse)
             magic_rev_item.setData(Qt.UserRole, real_idx)
-            self.table.setItem(table_row, 6, magic_rev_item)
+            self.table.setItem(table_row, 7, magic_rev_item)
 
             risk_item = QTableWidgetItem(row.risk_pct)
             risk_item.setData(Qt.UserRole, real_idx)
-            self.table.setItem(table_row, 7, risk_item)
+            self.table.setItem(table_row, 8, risk_item)
 
             conf_item = QTableWidgetItem("Sí" if row.configured else "No")
             conf_item.setData(Qt.UserRole, real_idx)
             conf_item.setForeground(QColor("#72e3c0") if row.configured else QColor("#f0c36d"))
-            self.table.setItem(table_row, 8, conf_item)
+            self.table.setItem(table_row, 9, conf_item)
 
         self.table.resizeRowsToContents()
         self.table.blockSignals(False)
@@ -554,12 +727,19 @@ class ChannelManagerWindow(QMainWindow):
         self.load_current_row_into_editor()
 
     def on_table_item_changed(self, item: QTableWidgetItem):
-        if item.column() != 0:
-            return
         real_idx = item.data(Qt.UserRole)
         if real_idx is None:
             return
-        self.rows[int(real_idx)].selected = item.checkState() == Qt.Checked
+
+        row = self.rows[int(real_idx)]
+
+        if item.column() == 0:
+            row.selected_live = item.checkState() == Qt.Checked
+        elif item.column() == 1:
+            row.selected_replay = item.checkState() == Qt.Checked
+
+        if self.selected_row_index == int(real_idx):
+            self.load_current_row_into_editor()
 
     def load_current_row_into_editor(self):
         if self.selected_row_index is None:
@@ -567,7 +747,9 @@ class ChannelManagerWindow(QMainWindow):
 
         row = self.rows[self.selected_row_index]
         self.lbl_selected_channel.setText(f"{row.channel_name} · {row.telegram_id}")
-        self.chk_selected.setChecked(row.selected)
+        self.chk_live.setChecked(row.selected_live)
+        self.chk_replay.setChecked(row.selected_replay)
+        self.chk_replay_editor.setChecked(row.selected_replay)
         self.chk_enabled.setChecked(row.enabled)
         self.input_magic.setText(row.magic)
         self.chk_reverse.setChecked(row.enable_reverse)
@@ -582,7 +764,8 @@ class ChannelManagerWindow(QMainWindow):
             return
 
         row = self.rows[self.selected_row_index]
-        row.selected = self.chk_selected.isChecked()
+        row.selected_live = self.chk_live.isChecked()
+        row.selected_replay = self.chk_replay.isChecked() or self.chk_replay_editor.isChecked()
         row.enabled = self.chk_enabled.isChecked()
         row.magic = self.input_magic.text().strip()
         row.enable_reverse = self.chk_reverse.isChecked()
@@ -596,9 +779,9 @@ class ChannelManagerWindow(QMainWindow):
         self._render_table()
 
     def _validate_row(self, row: RowState):
-        if row.selected:
+        if row.selected_live:
             if not row.magic:
-                raise ValueError(f"El canal '{row.channel_name}' está seleccionado pero no tiene magic.")
+                raise ValueError(f"El canal '{row.channel_name}' está activo en live pero no tiene magic.")
             int(row.magic)
             float(row.risk_pct)
 
@@ -617,7 +800,7 @@ class ChannelManagerWindow(QMainWindow):
         disabled = 0
 
         for row in self.rows:
-            if row.selected:
+            if row.selected_live:
                 self._validate_row(row)
                 upsert_channel_config(
                     channel_name=row.channel_name,
@@ -638,22 +821,74 @@ class ChannelManagerWindow(QMainWindow):
                     disabled += 1
 
         self.status.showMessage(
-            f"Configuración guardada. Activos: {saved} · Desactivados: {disabled}"
+            f"Configuración live guardada. Activos: {saved} · Desactivados: {disabled}"
         )
         QMessageBox.information(
             self,
             "Guardar configuración",
-            f"Configuración guardada correctamente.\n"
+            f"Configuración live guardada correctamente.\n"
             f"Canales activos: {saved}\n"
             f"Canales desactivados: {disabled}",
         )
         self._render_table()
 
+    def browse_db_path(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Seleccionar BBDD SQLite",
+            self.input_db_path.text().strip() or DB_PATH_BT,
+            "SQLite DB (*.db *.sqlite *.sqlite3);;Todos los archivos (*)",
+        )
+        if path:
+            self.input_db_path.setText(path)
+
+    def _get_replay_channel_ids(self) -> List[int]:
+        return [r.telegram_id for r in self.rows if r.selected_replay]
+
+    def mark_replay_all_visible(self):
+        if self.selected_row_index is not None:
+            self.apply_editor_to_current_row()
+
+        count = 0
+        for idx in self._get_visible_real_indexes():
+            self.rows[idx].selected_replay = True
+            count += 1
+
+        self._render_table()
+        self.status.showMessage(f"Canales marcados para replay: {count}")
+
+    def unmark_replay_all(self):
+        if self.selected_row_index is not None:
+            self.apply_editor_to_current_row()
+
+        for row in self.rows:
+            row.selected_replay = False
+
+        self._render_table()
+        if self.selected_row_index is not None:
+            self.load_current_row_into_editor()
+        self.status.showMessage("Selección replay limpiada")
+
+    def copy_live_to_replay(self):
+        if self.selected_row_index is not None:
+            self.apply_editor_to_current_row()
+
+        count = 0
+        for row in self.rows:
+            row.selected_replay = bool(row.selected_live)
+            if row.selected_replay:
+                count += 1
+
+        self._render_table()
+        if self.selected_row_index is not None:
+            self.load_current_row_into_editor()
+        self.status.showMessage(f"Replay sincronizado con Live: {count} canales")
+
     def start_listener(self):
         try:
             self.save_all()
-        except Exception as e:
-            logger.exception("Error iniciando listener")
+        except Exception:
+            logger.exception("Error iniciando listener live")
             self._show_error_dialog("Error", traceback.format_exc())
             return
 
@@ -661,7 +896,14 @@ class ChannelManagerWindow(QMainWindow):
             QMessageBox.information(self, "Listener", "El listener ya está en ejecución.")
             return
 
-        self.listener_worker = ListenerWorker(self.api_id, self.api_hash, self.session_name)
+        db_path = DB_PATH_REAL
+
+        self.listener_worker = ListenerWorker(
+            self.api_id,
+            self.api_hash,
+            self.session_name,
+            db_path=db_path,
+        )
         self.listener_worker.status_text.connect(self.status.showMessage)
         self.listener_worker.failed.connect(self._on_worker_failed)
         self.listener_worker.start()
@@ -669,8 +911,56 @@ class ChannelManagerWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Listener",
-            "Listener iniciado en segundo plano.\nLa ventana puede permanecer abierta.",
+            "Listener live iniciado en segundo plano.\nLa ventana puede permanecer abierta.",
         )
+
+    def start_replay(self):
+        if self.selected_row_index is not None:
+            self.apply_editor_to_current_row()
+
+        selected_channel_ids = self._get_replay_channel_ids()
+        if not selected_channel_ids:
+            QMessageBox.warning(self, "Replay", "Marca al menos un canal en la columna Replay.")
+            return
+
+        db_path = self.input_db_path.text().strip()
+        if not db_path:
+            QMessageBox.warning(self, "Replay", "Indica una BBDD destino para el replay.")
+            return
+
+        qdate_from = self.date_from.date()
+        date_from = datetime.combine(qdate_from.toPython(), time.min)
+
+        date_to = None
+        if self.chk_date_to.isChecked():
+            qdate_to = self.date_to.date()
+            date_to = datetime.combine(qdate_to.toPython(), time.max)
+            if date_to < date_from:
+                QMessageBox.warning(self, "Replay", "La fecha hasta no puede ser anterior a la fecha desde.")
+                return
+
+        if self.replay_worker and self.replay_worker.isRunning():
+            QMessageBox.information(self, "Replay", "Ya hay un replay en ejecución.")
+            return
+
+        self.replay_worker = ReplayWorker(
+            api_id=self.api_id,
+            api_hash=self.api_hash,
+            session_name=self.session_name,
+            selected_channel_ids=selected_channel_ids,
+            date_from=date_from,
+            date_to=date_to,
+            db_path=db_path,
+        )
+        self.replay_worker.status_text.connect(self.status.showMessage)
+        self.replay_worker.failed.connect(self._on_worker_failed)
+        self.replay_worker.finished_ok.connect(self._on_replay_finished)
+        self.set_busy(True, "Iniciando replay...")
+        self.replay_worker.start()
+
+    def _on_replay_finished(self, message: str):
+        self.set_busy(False, message)
+        QMessageBox.information(self, "Replay", message)
 
 
 def run_gui(api_id: int, api_hash: str, session_name: str = "tg_session_v1"):

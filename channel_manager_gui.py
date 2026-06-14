@@ -1,14 +1,18 @@
+import os
 import sys
 import traceback
 from dataclasses import dataclass
+from datetime import datetime, time
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QDate, QThread, Signal
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDateEdit,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -26,7 +30,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .db import get_channel_config_map, init_schema, upsert_channel_config, disable_channel_config
+from .db import (
+    DB_PATH_BT,
+    DB_PATH_REAL,
+    disable_channel_config,
+    get_channel_config_map,
+    init_schema,
+    set_db_path,
+    upsert_channel_config,
+)
 from .listener import TelegramSignalListener
 from .telegram_service import TelegramDialogInfo, TelegramDialogService
 
@@ -83,17 +95,62 @@ class ListenerWorker(QThread):
     status_text = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, api_id: int, api_hash: str, session_name: str = "tg_session_v1"):
+    def __init__(self, api_id: int, api_hash: str, session_name: str = "tg_session_v1", db_path: Optional[str] = None):
         super().__init__()
         self.api_id = api_id
         self.api_hash = api_hash
         self.session_name = session_name
+        self.db_path = db_path
 
     def run(self):
         try:
+            if self.db_path:
+                set_db_path(self.db_path)
+                init_schema()
             self.status_text.emit("Iniciando listener...")
             listener = TelegramSignalListener(self.api_id, self.api_hash, session_name=self.session_name)
             listener.run_forever()
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class ReplayWorker(QThread):
+    status_text = Signal(str)
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        api_id: int,
+        api_hash: str,
+        session_name: str,
+        selected_channel_ids: List[int],
+        date_from: datetime,
+        date_to: Optional[datetime],
+        db_path: str,
+    ):
+        super().__init__()
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.session_name = session_name
+        self.selected_channel_ids = selected_channel_ids
+        self.date_from = date_from
+        self.date_to = date_to
+        self.db_path = db_path
+
+    def run(self):
+        try:
+            set_db_path(self.db_path)
+            init_schema()
+            self.status_text.emit(f"Replay usando DB: {self.db_path}")
+            listener = TelegramSignalListener(self.api_id, self.api_hash, session_name=self.session_name)
+            total = listener.run_replay(
+                selected_channel_ids=self.selected_channel_ids,
+                date_from=self.date_from,
+                date_to=self.date_to,
+                progress_callback=self.status_text.emit,
+            )
+            self.finished_ok.emit(f"Replay finalizado. Mensajes procesados: {total}")
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -110,6 +167,7 @@ class ChannelManagerWindow(QMainWindow):
         self.dialogs: List[TelegramDialogInfo] = []
         self.selected_row_index: Optional[int] = None
         self.listener_worker: Optional[ListenerWorker] = None
+        self.replay_worker: Optional[ReplayWorker] = None
         self.load_worker: Optional[LoadDialogsWorker] = None
         self.test_worker: Optional[TestConnectionWorker] = None
 
@@ -119,7 +177,7 @@ class ChannelManagerWindow(QMainWindow):
 
     def _setup_ui(self):
         self.setWindowTitle("Telegram Trade Bridge · Channel Manager")
-        self.resize(1450, 860)
+        self.resize(1480, 900)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -136,7 +194,7 @@ class ChannelManagerWindow(QMainWindow):
         title_box = QVBoxLayout()
         title = QLabel("Telegram Bridge")
         title.setObjectName("TitleLabel")
-        subtitle = QLabel("Gestión visual de canales y configuración persistente por telegram_id")
+        subtitle = QLabel("Gestión visual de canales, listener live y replay histórico")
         subtitle.setObjectName("SubtitleLabel")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
@@ -256,10 +314,51 @@ class ChannelManagerWindow(QMainWindow):
         actions.addWidget(self.btn_reload_row)
         right_layout.addLayout(actions)
 
+        replay_box = QFrame()
+        replay_box.setObjectName("Panel")
+        replay_layout = QFormLayout(replay_box)
+        replay_layout.setContentsMargins(12, 12, 12, 12)
+        replay_layout.setSpacing(10)
+
+        self.chk_replay_mode = QCheckBox("Usar modo replay / backtesting")
+        self.date_from = QDateEdit()
+        self.date_from.setCalendarPopup(True)
+        self.date_from.setDisplayFormat("yyyy-MM-dd")
+        self.date_from.setDate(QDate.currentDate().addDays(-7))
+
+        self.date_to = QDateEdit()
+        self.date_to.setCalendarPopup(True)
+        self.date_to.setDisplayFormat("yyyy-MM-dd")
+        self.date_to.setDate(QDate.currentDate())
+        self.chk_date_to = QCheckBox("Usar fecha hasta")
+        self.chk_date_to.setChecked(False)
+        self.date_to.setEnabled(False)
+
+        self.input_db_path = QLineEdit()
+        self.input_db_path.setText(DB_PATH_BT)
+        self.btn_browse_db = QPushButton("Examinar...")
+        db_row = QHBoxLayout()
+        db_row.addWidget(self.input_db_path, 1)
+        db_row.addWidget(self.btn_browse_db)
+
+        self.btn_start_replay = QPushButton("Lanzar replay")
+
+        replay_layout.addRow("", self.chk_replay_mode)
+        replay_layout.addRow("Desde", self.date_from)
+        replay_layout.addRow("", self.chk_date_to)
+        replay_layout.addRow("Hasta", self.date_to)
+
+        db_wrap = QWidget()
+        db_wrap.setLayout(db_row)
+        replay_layout.addRow("BBDD destino", db_wrap)
+        replay_layout.addRow("", self.btn_start_replay)
+
+        right_layout.addWidget(replay_box)
+
         info_box = QLabel(
-            "Marca los canales que quieres usar, asigna magic y guarda. "
-            "La configuración se persiste en channel_config para que al reiniciar "
-            "ya aparezcan como configurados."
+            "Modo normal: listener en tiempo real.\n"
+            "Modo replay: procesa mensajes antiguos de los canales seleccionados "
+            "en la tabla y los guarda en la BBDD indicada."
         )
         info_box.setWordWrap(True)
         info_box.setObjectName("InfoBox")
@@ -267,7 +366,7 @@ class ChannelManagerWindow(QMainWindow):
         right_layout.addStretch(1)
 
         splitter.addWidget(right_panel)
-        splitter.setSizes([980, 420])
+        splitter.setSizes([980, 460])
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -282,6 +381,10 @@ class ChannelManagerWindow(QMainWindow):
         self.btn_reload_row.clicked.connect(self.load_current_row_into_editor)
         self.table.itemSelectionChanged.connect(self.on_table_selection_changed)
         self.table.itemChanged.connect(self.on_table_item_changed)
+
+        self.chk_date_to.toggled.connect(self.date_to.setEnabled)
+        self.btn_browse_db.clicked.connect(self.browse_db_path)
+        self.btn_start_replay.clicked.connect(self.start_replay)
 
         self._build_menu()
         self._apply_styles()
@@ -341,7 +444,7 @@ class ChannelManagerWindow(QMainWindow):
         QPushButton:pressed {
             background: #1f2531;
         }
-        QLineEdit, QComboBox {
+        QLineEdit, QComboBox, QDateEdit {
             background: #0f1319;
             color: #eef2f7;
             border: 1px solid #313948;
@@ -380,6 +483,9 @@ class ChannelManagerWindow(QMainWindow):
     def set_busy(self, busy: bool, message: str = ""):
         self.btn_refresh.setEnabled(not busy)
         self.btn_test.setEnabled(not busy)
+        self.btn_save.setEnabled(not busy)
+        self.btn_start.setEnabled(not busy)
+        self.btn_start_replay.setEnabled(not busy)
         if message:
             self.status.showMessage(message)
 
@@ -576,12 +682,12 @@ class ChannelManagerWindow(QMainWindow):
             int(row.magic)
             float(row.risk_pct)
 
-            if row.enable_reverse:
-                if not row.magic_reverse:
-                    raise ValueError(
-                        f"El canal '{row.channel_name}' tiene inverso activado pero no magic inverso."
-                    )
-                int(row.magic_reverse)
+        if row.enable_reverse:
+            if not row.magic_reverse:
+                raise ValueError(
+                    f"El canal '{row.channel_name}' tiene inverso activado pero no magic inverso."
+                )
+            int(row.magic_reverse)
 
     def save_all(self):
         if self.selected_row_index is not None:
@@ -623,6 +729,20 @@ class ChannelManagerWindow(QMainWindow):
         )
         self._render_table()
 
+    def browse_db_path(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Seleccionar BBDD SQLite",
+            self.input_db_path.text().strip() or DB_PATH_BT,
+            "SQLite DB (*.db *.sqlite *.sqlite3);;Todos los archivos (*)",
+        )
+        if path:
+            self.input_db_path.setText(path)
+
+    def _get_selected_channel_ids(self) -> List[int]:
+        selected = [r.telegram_id for r in self.rows if r.selected]
+        return selected
+
     def start_listener(self):
         try:
             self.save_all()
@@ -634,7 +754,14 @@ class ChannelManagerWindow(QMainWindow):
             QMessageBox.information(self, "Listener", "El listener ya está en ejecución.")
             return
 
-        self.listener_worker = ListenerWorker(self.api_id, self.api_hash, self.session_name)
+        db_path = self.input_db_path.text().strip() or DB_PATH_REAL
+
+        self.listener_worker = ListenerWorker(
+            self.api_id,
+            self.api_hash,
+            self.session_name,
+            db_path=db_path,
+        )
         self.listener_worker.status_text.connect(self.status.showMessage)
         self.listener_worker.failed.connect(self._on_worker_failed)
         self.listener_worker.start()
@@ -645,6 +772,56 @@ class ChannelManagerWindow(QMainWindow):
             "Listener iniciado en segundo plano.\nLa ventana puede permanecer abierta.",
         )
 
+    def start_replay(self):
+        try:
+            self.save_all()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+            return
+
+        selected_channel_ids = self._get_selected_channel_ids()
+        if not selected_channel_ids:
+            QMessageBox.warning(self, "Replay", "Selecciona al menos un canal para el replay.")
+            return
+
+        db_path = self.input_db_path.text().strip()
+        if not db_path:
+            QMessageBox.warning(self, "Replay", "Indica una BBDD destino para el replay.")
+            return
+
+        qdate_from = self.date_from.date()
+        date_from = datetime.combine(qdate_from.toPython(), time.min)
+
+        date_to = None
+        if self.chk_date_to.isChecked():
+            qdate_to = self.date_to.date()
+            date_to = datetime.combine(qdate_to.toPython(), time.max)
+            if date_to < date_from:
+                QMessageBox.warning(self, "Replay", "La fecha hasta no puede ser anterior a la fecha desde.")
+                return
+
+        if self.replay_worker and self.replay_worker.isRunning():
+            QMessageBox.information(self, "Replay", "Ya hay un replay en ejecución.")
+            return
+
+        self.replay_worker = ReplayWorker(
+            api_id=self.api_id,
+            api_hash=self.api_hash,
+            session_name=self.session_name,
+            selected_channel_ids=selected_channel_ids,
+            date_from=date_from,
+            date_to=date_to,
+            db_path=db_path,
+        )
+        self.replay_worker.status_text.connect(self.status.showMessage)
+        self.replay_worker.failed.connect(self._on_worker_failed)
+        self.replay_worker.finished_ok.connect(self._on_replay_finished)
+        self.set_busy(True, "Iniciando replay...")
+        self.replay_worker.start()
+
+    def _on_replay_finished(self, message: str):
+        self.set_busy(False, message)
+        QMessageBox.information(self, "Replay", message)
 
 def run_gui(api_id: int, api_hash: str, session_name: str = "tg_session_v1"):
     app = QApplication.instance() or QApplication(sys.argv)

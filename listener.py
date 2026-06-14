@@ -1,13 +1,3 @@
-"""
-listener.py – Escucha Telegram y procesa señales (telegram_bridge_v1)
-
-Características:
-- Lookup de canal SOLO por telegram_id numérico.
-- Sin dispatcher: llama directamente a parse_universal.
-- Soporta modo live y replay/backtesting.
-- Corregido para funcionar dentro de QThread con asyncio event loop propio.
-"""
-
 import asyncio
 import logging
 from copy import deepcopy
@@ -23,7 +13,6 @@ from .db import (
     insert_signal,
     insert_sl_move,
 )
-
 from .universal_parser import parse_universal
 
 logger = logging.getLogger(__name__)
@@ -74,15 +63,25 @@ class TelegramSignalListener:
 
     async def _connect_client(self):
         self._ensure_client()
-        if not await self.client.is_user_authorized():
-            await self.client.start()
-        else:
+
+        if not self.client.is_connected():
             await self.client.connect()
+
+        if not await self.client.is_user_authorized():
+            raise RuntimeError(
+                "La sesión de Telegram no está autorizada. "
+                "Abre primero la aplicación en modo normal y valida la sesión."
+            )
+
+    async def _start_client_for_live(self):
+        self._ensure_client()
+        await self.client.start()
 
     async def _disconnect_client(self):
         if self.client:
             try:
-                await self.client.disconnect()
+                if self.client.is_connected():
+                    await self.client.disconnect()
             except Exception:
                 logger.exception("Error cerrando cliente Telethon")
 
@@ -92,12 +91,9 @@ class TelegramSignalListener:
 
     def _resolve_lookup_ids(self, raw_chat_id: int) -> List[int]:
         ids = [int(raw_chat_id)]
-
-        # Forma normalizada usada a veces con supergroups/channels
         alt_id = -(1_000_000_000_000 + abs(int(raw_chat_id)))
         if alt_id not in ids:
             ids.append(alt_id)
-
         return ids
 
     def _get_cfg_for_chat_id(self, raw_chat_id: int) -> Optional[Dict]:
@@ -139,7 +135,7 @@ class TelegramSignalListener:
         msg_ts: int,
         text: str,
     ) -> int:
-        raw_msg_id = insert_raw_message({
+        return insert_raw_message({
             "channel_id": str(raw_chat_id),
             "channel_name": channel_name,
             "message_id": msg_id,
@@ -147,7 +143,6 @@ class TelegramSignalListener:
             "text": text,
             "raw_json": None,
         })
-        return raw_msg_id
 
     def _post_process_signals(
         self,
@@ -174,7 +169,7 @@ class TelegramSignalListener:
                     sd.get("symbol"),
                     channel_name,
                     sd.get("sl"),
-                    reply_to_id or 0
+                    reply_to_id or 0,
                 )
                 logger.info(
                     "SL_MOVE id=%s canal=%s sl=%s symbol=%s",
@@ -226,7 +221,7 @@ class TelegramSignalListener:
 
         return enriched
 
-    def _persist_signals(self, signals: List[Dict]):
+    def _persist_signals(self, signals: List[Dict]) -> int:
         total = 0
         for sig in signals:
             if not sig.get("action"):
@@ -301,9 +296,7 @@ class TelegramSignalListener:
         inserted = self._persist_signals(enriched)
 
         if progress_callback and inserted:
-            progress_callback(
-                f"{channel_name}: msg {msg.id} -> {inserted} señal(es)"
-            )
+            progress_callback(f"{channel_name}: msg {msg.id} -> {inserted} señal(es)")
 
         return inserted
 
@@ -312,7 +305,7 @@ class TelegramSignalListener:
     # ------------------------------------------------------------------
 
     async def _async_start_live(self):
-        await self._connect_client()
+        await self._start_client_for_live()
         logger.info("Cliente Telethon v1 iniciado")
         self._register_handlers()
 

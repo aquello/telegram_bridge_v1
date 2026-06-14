@@ -61,6 +61,70 @@ class RowState:
     configured: bool = False
 
 
+class LogWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Telegram Bridge · Log en tiempo real")
+        self.resize(1180, 760)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        top = QHBoxLayout()
+        self.btn_clear = QPushButton("Limpiar")
+        self.btn_hide = QPushButton("Ocultar")
+        top.addStretch()
+        top.addWidget(self.btn_clear)
+        top.addWidget(self.btn_hide)
+
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setMaximumBlockCount(10000)
+        self.output.setPlaceholderText("Aquí verás los mensajes recibidos, parseo, inserciones en DB, señales y errores...")
+
+        layout.addLayout(top)
+        layout.addWidget(self.output, 1)
+
+        self.btn_clear.clicked.connect(self.output.clear)
+        self.btn_hide.clicked.connect(self.hide)
+
+        self.setStyleSheet("""
+        QMainWindow {
+            background: #0f1115;
+        }
+        QPushButton {
+            background: #232938;
+            color: #f2f4f8;
+            border: 1px solid #2f3747;
+            border-radius: 10px;
+            padding: 10px 14px;
+            font-weight: 600;
+        }
+        QPushButton:hover {
+            background: #2b3344;
+        }
+        QPlainTextEdit {
+            background: #0f1319;
+            color: #e8edf5;
+            border: 1px solid #313948;
+            border-radius: 12px;
+            padding: 10px;
+            selection-background-color: #244b73;
+        }
+        """)
+
+    def append_log(self, text: str):
+        now = datetime.now().strftime("%H:%M:%S")
+        self.output.appendPlainText(f"{now} | {text}")
+        cursor = self.output.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.output.setTextCursor(cursor)
+        self.output.ensureCursorVisible()
+
+
 class LoadDialogsWorker(QThread):
     finished_ok = Signal(list)
     failed = Signal(str)
@@ -121,8 +185,12 @@ class ListenerWorker(QThread):
 
             self.status_text.emit("Iniciando listener live...")
             self.log_message.emit(f"INFO | LIVE | Usando DB: {self.db_path or DB_PATH_REAL}")
-            self.log_message.emit("INFO | LIVE | Creando TelegramSignalListener")
-            listener = TelegramSignalListener(self.api_id, self.api_hash, session_name=self.session_name)
+            listener = TelegramSignalListener(
+                self.api_id,
+                self.api_hash,
+                session_name=self.session_name,
+                progress_callback=self.log_message.emit,
+            )
             self.log_message.emit("INFO | LIVE | Listener live arrancando")
             listener.run_forever()
         except Exception:
@@ -165,7 +233,12 @@ class ReplayWorker(QThread):
             self.log_message.emit(f"INFO | REPLAY | Desde: {self.date_from}")
             self.log_message.emit(f"INFO | REPLAY | Hasta: {self.date_to if self.date_to else 'sin límite'}")
 
-            listener = TelegramSignalListener(self.api_id, self.api_hash, session_name=self.session_name)
+            listener = TelegramSignalListener(
+                self.api_id,
+                self.api_hash,
+                session_name=self.session_name,
+                progress_callback=self.log_message.emit,
+            )
 
             total = listener.run_replay(
                 selected_channel_ids=self.selected_channel_ids,
@@ -181,7 +254,7 @@ class ReplayWorker(QThread):
 
     def _emit_progress(self, text: str):
         self.status_text.emit(text)
-        self.log_message.emit(f"INFO | REPLAY | {text}")
+        self.log_message.emit(text)
 
 
 class ChannelManagerWindow(QMainWindow):
@@ -206,7 +279,9 @@ class ChannelManagerWindow(QMainWindow):
 
     def _setup_ui(self):
         self.setWindowTitle("Telegram Trade Bridge · Channel Manager")
-        self.resize(1500, 940)
+        self.resize(1520, 920)
+
+        self.log_window = LogWindow()
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -223,7 +298,7 @@ class ChannelManagerWindow(QMainWindow):
         title_box = QVBoxLayout()
         title = QLabel("Telegram Bridge")
         title.setObjectName("TitleLabel")
-        subtitle = QLabel("Gestión visual de canales, live, replay y seguimiento en tiempo real")
+        subtitle = QLabel("Gestión visual de canales, live, replay y consola externa")
         subtitle.setObjectName("SubtitleLabel")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
@@ -236,6 +311,7 @@ class ChannelManagerWindow(QMainWindow):
         self.btn_show_configured = QPushButton("Ver solo configurados: No")
         self.btn_save = QPushButton("Guardar configuración live")
         self.btn_start = QPushButton("Iniciar listener live")
+        self.btn_open_log = QPushButton("Abrir log")
 
         self.btn_show_configured.setCheckable(True)
 
@@ -244,16 +320,13 @@ class ChannelManagerWindow(QMainWindow):
         top_layout.addWidget(self.btn_show_configured)
         top_layout.addWidget(self.btn_save)
         top_layout.addWidget(self.btn_start)
+        top_layout.addWidget(self.btn_open_log)
 
         root.addWidget(top_bar)
 
-        splitter_main = QSplitter(Qt.Vertical)
-        splitter_main.setChildrenCollapsible(False)
-        root.addWidget(splitter_main, 1)
-
-        splitter_top = QSplitter()
-        splitter_top.setChildrenCollapsible(False)
-        splitter_main.addWidget(splitter_top)
+        splitter = QSplitter()
+        splitter.setChildrenCollapsible(False)
+        root.addWidget(splitter, 1)
 
         left_panel = QFrame()
         left_panel.setObjectName("Panel")
@@ -309,20 +382,18 @@ class ChannelManagerWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeToContents)
 
         left_layout.addWidget(self.table)
-        splitter_top.addWidget(left_panel)
+        splitter.addWidget(left_panel)
 
         right_scroll = QScrollArea()
         right_scroll.setWidgetResizable(True)
         right_scroll.setFrameShape(QFrame.NoFrame)
         right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        right_scroll.setObjectName("RightScroll")
 
         right_panel = QFrame()
         right_panel.setObjectName("Panel")
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(16, 16, 16, 16)
         right_layout.setSpacing(14)
-
         right_scroll.setWidget(right_panel)
 
         live_box = QFrame()
@@ -360,7 +431,6 @@ class ChannelManagerWindow(QMainWindow):
         self.cmb_exec_type_rev.addItems(["MARKET", "PENDING"])
 
         self.input_risk = QLineEdit()
-        self.input_risk.setPlaceholderText("2.0")
         self.input_risk.setText("2.0")
 
         live_form.addRow("Canal", self.lbl_selected_channel)
@@ -400,7 +470,6 @@ class ChannelManagerWindow(QMainWindow):
         replay_form.setSpacing(10)
 
         self.chk_replay_editor = QCheckBox("Seleccionar este canal para replay")
-        self.chk_replay_editor.setChecked(False)
 
         self.date_from = QDateEdit()
         self.date_from.setCalendarPopup(True)
@@ -423,7 +492,6 @@ class ChannelManagerWindow(QMainWindow):
         db_row = QHBoxLayout()
         db_row.addWidget(self.input_db_path, 1)
         db_row.addWidget(self.btn_browse_db)
-
         db_wrap = QWidget()
         db_wrap.setLayout(db_row)
 
@@ -441,42 +509,16 @@ class ChannelManagerWindow(QMainWindow):
         right_layout.addWidget(replay_box)
 
         info_box = QLabel(
-            "Live y Replay están desacoplados.\n"
-            "Guardar configuración solo afecta a channel_config.\n"
-            "La selección Replay no toca la configuración persistente y sirve para depuración histórica."
+            "La consola se abre en una ventana independiente para poder seguir en detalle "
+            "mensajes recibidos, parseo, generación de señales e inserciones."
         )
         info_box.setWordWrap(True)
         info_box.setObjectName("InfoBox")
         right_layout.addWidget(info_box)
         right_layout.addStretch(1)
 
-        splitter_top.addWidget(right_scroll)
-        splitter_top.setSizes([980, 460])
-
-        log_panel = QFrame()
-        log_panel.setObjectName("Panel")
-        log_layout = QVBoxLayout(log_panel)
-        log_layout.setContentsMargins(12, 12, 12, 12)
-        log_layout.setSpacing(10)
-
-        log_header = QHBoxLayout()
-        log_title = QLabel("Actividad en tiempo real")
-        log_title.setObjectName("SectionTitle")
-        self.btn_clear_log = QPushButton("Limpiar log")
-        log_header.addWidget(log_title)
-        log_header.addStretch()
-        log_header.addWidget(self.btn_clear_log)
-
-        self.log_output = QPlainTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setMaximumBlockCount(2000)
-        self.log_output.setPlaceholderText("Aquí verás el detalle del listener, replay, parser y errores...")
-
-        log_layout.addLayout(log_header)
-        log_layout.addWidget(self.log_output, 1)
-
-        splitter_main.addWidget(log_panel)
-        splitter_main.setSizes([650, 260])
+        splitter.addWidget(right_scroll)
+        splitter.setSizes([980, 460])
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -486,6 +528,7 @@ class ChannelManagerWindow(QMainWindow):
         self.btn_test.clicked.connect(self.test_connection)
         self.btn_save.clicked.connect(self.save_all)
         self.btn_start.clicked.connect(self.start_listener)
+        self.btn_open_log.clicked.connect(self.show_log_window)
         self.btn_show_configured.clicked.connect(self.toggle_show_configured)
         self.btn_apply_row.clicked.connect(self.apply_editor_to_current_row)
         self.btn_reload_row.clicked.connect(self.load_current_row_into_editor)
@@ -500,11 +543,8 @@ class ChannelManagerWindow(QMainWindow):
         self.btn_replay_none.clicked.connect(self.unmark_replay_all)
         self.btn_replay_from_live.clicked.connect(self.copy_live_to_replay)
 
-        self.btn_clear_log.clicked.connect(self.log_output.clear)
-
         self._build_menu()
         self._apply_styles()
-
         self.append_log("INFO | GUI | Aplicación iniciada")
 
     def _build_menu(self):
@@ -515,35 +555,17 @@ class ChannelManagerWindow(QMainWindow):
 
     def _apply_styles(self):
         self.setStyleSheet("""
-        QMainWindow {
-            background: #0f1115;
-        }
+        QMainWindow { background: #0f1115; }
         #TopBar, #Panel, #InnerPanel {
             background: #171a21;
             border: 1px solid #252b36;
             border-radius: 14px;
         }
-        #InnerPanel {
-            background: #141820;
-        }
-        #TitleLabel {
-            font-size: 24px;
-            font-weight: 700;
-            color: #f3f5f7;
-        }
-        #SubtitleLabel {
-            color: #99a2b2;
-            font-size: 13px;
-        }
-        #SectionTitle {
-            font-size: 18px;
-            font-weight: 700;
-            color: #eef2f7;
-        }
-        #SelectedChannelLabel {
-            color: #72e3c0;
-            font-weight: 600;
-        }
+        #InnerPanel { background: #141820; }
+        #TitleLabel { font-size: 24px; font-weight: 700; color: #f3f5f7; }
+        #SubtitleLabel { color: #99a2b2; font-size: 13px; }
+        #SectionTitle { font-size: 18px; font-weight: 700; color: #eef2f7; }
+        #SelectedChannelLabel { color: #72e3c0; font-weight: 600; }
         #InfoBox {
             background: #11151c;
             border: 1px solid #252b36;
@@ -559,13 +581,9 @@ class ChannelManagerWindow(QMainWindow):
             padding: 10px 14px;
             font-weight: 600;
         }
-        QPushButton:hover {
-            background: #2b3344;
-        }
-        QPushButton:pressed {
-            background: #1f2531;
-        }
-        QLineEdit, QComboBox, QDateEdit, QPlainTextEdit {
+        QPushButton:hover { background: #2b3344; }
+        QPushButton:pressed { background: #1f2531; }
+        QLineEdit, QComboBox, QDateEdit {
             background: #0f1319;
             color: #eef2f7;
             border: 1px solid #313948;
@@ -589,39 +607,72 @@ class ChannelManagerWindow(QMainWindow):
             padding: 10px;
             font-weight: 700;
         }
-        QTableWidget::item:selected {
-            background: #20314b;
-        }
-        QLabel, QCheckBox {
-            color: #dbe2ec;
-        }
-        QStatusBar {
-            background: #131720;
-            color: #c7d0db;
-        }
-        QScrollArea {
-            border: none;
-            background: transparent;
-        }
+        QTableWidget::item:selected { background: #20314b; }
+        QLabel, QCheckBox { color: #dbe2ec; }
+        QStatusBar { background: #131720; color: #c7d0db; }
+        QScrollArea { border: none; background: transparent; }
         """)
 
-    def append_log(self, text: str):
-        now = datetime.now().strftime("%H:%M:%S")
-        self.log_output.appendPlainText(f"{now} | {text}")
-        cursor = self.log_output.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.log_output.setTextCursor(cursor)
-        self.log_output.ensureCursorVisible()
+    def _message_box_style(self) -> str:
+        return """
+        QMessageBox {
+            background-color: #171a21;
+        }
+        QMessageBox QLabel {
+            color: #eef2f7;
+            background: transparent;
+            font-size: 13px;
+        }
+        QMessageBox QPushButton {
+            min-width: 90px;
+            background: #232938;
+            color: #f2f4f8;
+            border: 1px solid #2f3747;
+            border-radius: 8px;
+            padding: 8px 12px;
+            font-weight: 600;
+        }
+        QMessageBox QPushButton:hover {
+            background: #2b3344;
+        }
+        QPlainTextEdit {
+            background: #0f1319;
+            color: #eef2f7;
+            border: 1px solid #313948;
+        }
+        QTextEdit {
+            background: #0f1319;
+            color: #eef2f7;
+            border: 1px solid #313948;
+        }
+        """
 
-    def _show_error_dialog(self, title: str, err: str):
-        self.append_log("ERROR | GUI | Se produjo un error, revisa el detalle")
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Critical)
-        msg.setWindowTitle(title)
-        msg.setText("Se produjo un error.")
-        msg.setDetailedText(err)
-        msg.setStandardButtons(QMessageBox.Ok)
-        msg.exec()
+    def _show_message(self, icon, title: str, text: str, details: Optional[str] = None):
+        box = QMessageBox(self)
+        box.setIcon(icon)
+        box.setWindowTitle(title)
+        box.setText(text)
+        if details:
+            box.setDetailedText(details)
+        box.setStyleSheet(self._message_box_style())
+        box.exec()
+
+    def show_info(self, title: str, text: str):
+        self._show_message(QMessageBox.Information, title, text)
+
+    def show_warning(self, title: str, text: str):
+        self._show_message(QMessageBox.Warning, title, text)
+
+    def show_error(self, title: str, text: str, details: Optional[str] = None):
+        self._show_message(QMessageBox.Critical, title, text, details)
+
+    def show_log_window(self):
+        self.log_window.show()
+        self.log_window.raise_()
+        self.log_window.activateWindow()
+
+    def append_log(self, text: str):
+        self.log_window.append_log(text)
 
     def set_busy(self, busy: bool, message: str = ""):
         self.btn_refresh.setEnabled(not busy)
@@ -647,9 +698,9 @@ class ChannelManagerWindow(QMainWindow):
     def _on_test_connection_ok(self, ok: bool):
         self.set_busy(False, "Conexión correcta" if ok else "No se pudo validar la conexión")
         if ok:
-            QMessageBox.information(self, "Telegram", "Conexión correcta con Telegram.")
+            self.show_info("Telegram", "Conexión correcta con Telegram.")
         else:
-            QMessageBox.warning(self, "Telegram", "No se pudo validar la conexión.")
+            self.show_warning("Telegram", "No se pudo validar la conexión.")
 
     def refresh_dialogs(self):
         self.set_busy(True, "Cargando canales desde Telegram...")
@@ -662,8 +713,8 @@ class ChannelManagerWindow(QMainWindow):
     def _on_worker_failed(self, err: str):
         self.set_busy(False, "Error")
         self.append_log("ERROR | WORKER | Fallo en worker")
-        self.append_log(err.strip().splitlines()[-1] if err.strip() else "ERROR | WORKER | Error desconocido")
-        self._show_error_dialog("Error", err)
+        self.append_log(err)
+        self.show_error("Error", "Se produjo un error.", err)
 
     def _on_dialogs_loaded(self, dialogs: List[TelegramDialogInfo]):
         self.set_busy(False, f"Se cargaron {len(dialogs)} diálogos")
@@ -728,7 +779,6 @@ class ChannelManagerWindow(QMainWindow):
 
     def _render_table(self):
         self.table.blockSignals(True)
-
         visible_indexes = self._get_visible_real_indexes()
         self.table.setRowCount(len(visible_indexes))
 
@@ -794,16 +844,13 @@ class ChannelManagerWindow(QMainWindow):
         if not items:
             self.selected_row_index = None
             return
-
-        real_idx = items[0].data(Qt.UserRole)
-        self.selected_row_index = int(real_idx)
+        self.selected_row_index = int(items[0].data(Qt.UserRole))
         self.load_current_row_into_editor()
 
     def on_table_item_changed(self, item: QTableWidgetItem):
         real_idx = item.data(Qt.UserRole)
         if real_idx is None:
             return
-
         row = self.rows[int(real_idx)]
 
         if item.column() == 0:
@@ -833,7 +880,7 @@ class ChannelManagerWindow(QMainWindow):
 
     def apply_editor_to_current_row(self):
         if self.selected_row_index is None:
-            QMessageBox.warning(self, "Canal", "Selecciona una fila primero.")
+            self.show_warning("Canal", "Selecciona una fila primero.")
             return
 
         row = self.rows[self.selected_row_index]
@@ -861,9 +908,7 @@ class ChannelManagerWindow(QMainWindow):
 
         if row.enable_reverse:
             if not row.magic_reverse:
-                raise ValueError(
-                    f"El canal '{row.channel_name}' tiene inverso activado pero no magic inverso."
-                )
+                raise ValueError(f"El canal '{row.channel_name}' tiene inverso activado pero no magic inverso.")
             int(row.magic_reverse)
 
     def save_all(self):
@@ -894,16 +939,11 @@ class ChannelManagerWindow(QMainWindow):
                 if row.configured:
                     disabled += 1
 
-        self.status.showMessage(
-            f"Configuración live guardada. Activos: {saved} · Desactivados: {disabled}"
-        )
+        self.status.showMessage(f"Configuración live guardada. Activos: {saved} · Desactivados: {disabled}")
         self.append_log(f"INFO | DB | Configuración live guardada. Activos={saved} Desactivados={disabled}")
-        QMessageBox.information(
-            self,
+        self.show_info(
             "Guardar configuración",
-            f"Configuración live guardada correctamente.\n"
-            f"Canales activos: {saved}\n"
-            f"Canales desactivados: {disabled}",
+            f"Configuración live guardada correctamente.\nCanales activos: {saved}\nCanales desactivados: {disabled}",
         )
         self._render_table()
 
@@ -968,21 +1008,21 @@ class ChannelManagerWindow(QMainWindow):
             self.save_all()
         except Exception:
             self.append_log("ERROR | LIVE | Error validando antes de iniciar listener")
-            self._show_error_dialog("Error", traceback.format_exc())
+            self.show_error("Error", "Error validando antes de iniciar listener.", traceback.format_exc())
             return
 
         if self.listener_worker and self.listener_worker.isRunning():
-            QMessageBox.information(self, "Listener", "El listener ya está en ejecución.")
+            self.show_info("Listener", "El listener ya está en ejecución.")
             self.append_log("WARN | LIVE | El listener ya estaba en ejecución")
             return
 
-        db_path = DB_PATH_REAL
+        self.show_log_window()
 
         self.listener_worker = ListenerWorker(
             self.api_id,
             self.api_hash,
             self.session_name,
-            db_path=db_path,
+            db_path=DB_PATH_REAL,
         )
         self.listener_worker.status_text.connect(self.status.showMessage)
         self.listener_worker.failed.connect(self._on_worker_failed)
@@ -991,10 +1031,9 @@ class ChannelManagerWindow(QMainWindow):
         self.append_log("INFO | LIVE | Iniciando listener live...")
         self.listener_worker.start()
 
-        QMessageBox.information(
-            self,
+        self.show_info(
             "Listener",
-            "Listener live iniciado en segundo plano.\nLa ventana puede permanecer abierta.",
+            "Listener live iniciado en segundo plano.\nLa ventana de log mostrará la actividad detallada.",
         )
 
     def start_replay(self):
@@ -1003,13 +1042,13 @@ class ChannelManagerWindow(QMainWindow):
 
         selected_channel_ids = self._get_replay_channel_ids()
         if not selected_channel_ids:
-            QMessageBox.warning(self, "Replay", "Marca al menos un canal en la columna Replay.")
+            self.show_warning("Replay", "Marca al menos un canal en la columna Replay.")
             self.append_log("WARN | REPLAY | No hay canales seleccionados para replay")
             return
 
         db_path = self.input_db_path.text().strip()
         if not db_path:
-            QMessageBox.warning(self, "Replay", "Indica una BBDD destino para el replay.")
+            self.show_warning("Replay", "Indica una BBDD destino para el replay.")
             self.append_log("WARN | REPLAY | No se indicó DB destino")
             return
 
@@ -1021,14 +1060,16 @@ class ChannelManagerWindow(QMainWindow):
             qdate_to = self.date_to.date()
             date_to = datetime.combine(qdate_to.toPython(), time.max)
             if date_to < date_from:
-                QMessageBox.warning(self, "Replay", "La fecha hasta no puede ser anterior a la fecha desde.")
+                self.show_warning("Replay", "La fecha hasta no puede ser anterior a la fecha desde.")
                 self.append_log("WARN | REPLAY | Fecha hasta anterior a fecha desde")
                 return
 
         if self.replay_worker and self.replay_worker.isRunning():
-            QMessageBox.information(self, "Replay", "Ya hay un replay en ejecución.")
+            self.show_info("Replay", "Ya hay un replay en ejecución.")
             self.append_log("WARN | REPLAY | Ya hay un replay en ejecución")
             return
+
+        self.show_log_window()
 
         self.replay_worker = ReplayWorker(
             api_id=self.api_id,
@@ -1051,7 +1092,7 @@ class ChannelManagerWindow(QMainWindow):
     def _on_replay_finished(self, message: str):
         self.set_busy(False, message)
         self.append_log(f"INFO | REPLAY | {message}")
-        QMessageBox.information(self, "Replay", message)
+        self.show_info("Replay", message)
 
 
 def run_gui(api_id: int, api_hash: str, session_name: str = "tg_session_v1"):
